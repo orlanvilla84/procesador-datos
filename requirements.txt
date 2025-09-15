@@ -1,5 +1,5 @@
 flask
-pandas==2.2.2
+pandas
 openpyxl
 setuptools
 gunicorn
