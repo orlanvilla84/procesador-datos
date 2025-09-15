@@ -1,0 +1,20 @@
+# Archivos de sesión y temporales de la aplicación
+temp_sessions/
+spark_temp/
+*.db
+
+# Archivos de caché y compilados de Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env
+
+# Archivos específicos del sistema operativo y editor
+.vscode/
+.idea/
+.DS_Store

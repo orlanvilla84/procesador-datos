@@ -6,13 +6,9 @@ import threading
 import sqlite3
 import io
 import time
+import pandas as pd
 from flask import Flask, render_template, request, redirect, url_for, send_file, session, jsonify, flash, send_from_directory
 from werkzeug.utils import secure_filename
-from pyspark.sql import SparkSession
-import pandas as pd
-from decimal import Decimal
-from pyspark.sql.types import StructType, StructField, StringType
-from pyspark.sql.functions import col, lpad, to_timestamp, to_date
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN ---
 app = Flask(__name__)
@@ -20,94 +16,127 @@ app.config['SECRET_KEY'] = 'una-clave-secreta-muy-segura-12345'
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 SESSION_FOLDER = os.path.abspath('temp_sessions')
-SPARK_TEMP_DIR = os.path.abspath('spark_temp')
-
 app.config['SESSION_FOLDER'] = SESSION_FOLDER
 os.makedirs(SESSION_FOLDER, exist_ok=True)
-os.makedirs(SPARK_TEMP_DIR, exist_ok=True)
 
-spark = SparkSession.builder \
-    .appName("WebApp Final") \
-    .master("local[*]") \
-    .config("driver-memory", "2g") \
-    .config("spark.driver.host", "127.0.0.1") \
-    .config("spark.local.dir", SPARK_TEMP_DIR) \
-    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
-    .config("spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs", "false") \
-    .getOrCreate()
-
+# Diccionario global para el estado de los trabajos de procesamiento
 job_status = {}
 
 # --- LÓGICA DE PROCESAMIENTO ---
 def background_casting_job(session_data):
+    """
+    Realiza el casteo de datos en segundo plano usando Pandas.
+    Esta función reemplaza la versión original basada en PySpark.
+    """
     session_id = session_data['session_id']
     selected_parquets = session_data['selected_parquets']
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
+    
+    # Inicializar el estado del trabajo
     progress_initial = {table: {'status': 'Pendiente', 'percentage': 0} for table in selected_parquets}
     job_status[session_id] = {'overall_status': 'running', 'progress': progress_initial, 'error': None}
     
     try:
+        # Definir rutas de carpetas
         raw_folder = os.path.join(session_path, 'sin_castear_csv')
         schemas_folder = os.path.join(session_path, 'esquemas')
         output_partitioned_base = os.path.join(session_path, 'output_partitioned')
         os.makedirs(output_partitioned_base, exist_ok=True)
+        
+        # Conexión a la base de datos para resultados
         conn = sqlite3.connect(get_db_path(session_id))
-        TYPE_MAP = {'int32': 'integer', 'long': 'long', 'string': 'string','timestamp': 'timestamp', 'date': 'date', 'double': 'double','float': 'float', 'boolean': 'boolean'}
 
         for parquet_name in selected_parquets:
             job_status[session_id]['progress'][parquet_name] = {'status': 'Casteando tipos...', 'percentage': 33}
-            df_raw = spark.read.option("header", "true").option("inferSchema", "false").csv(os.path.join(raw_folder, f"{parquet_name}.csv"))
-            with open(os.path.join(schemas_folder, f"{parquet_name}.schema"), 'r') as f: schema_data = json.load(f)
+
+            # Cargar datos y esquema
+            csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
+            df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False) # Leer todo como texto
+            
+            schema_path = os.path.join(schemas_folder, f"{parquet_name}.schema")
+            with open(schema_path, 'r') as f:
+                schema_data = json.load(f)
+            
             partition_columns = schema_data.get('partitions', [])
-            df_casted = df_raw
+            df_casted = df_raw.copy()
+
+            # Iterar sobre las columnas definidas en el esquema para castear
             for field in schema_data['fields']:
                 field_name = field['name']
-                if field_name not in df_casted.columns: continue
+                if field_name not in df_casted.columns:
+                    continue
+
                 field_type_info = field['type']
                 primary_type = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
-                spark_type_str = TYPE_MAP.get(primary_type.lower(), primary_type)
-                if 'format' in field and primary_type.lower() in ['timestamp', 'date']:
-                    func = to_timestamp if primary_type.lower() == 'timestamp' else to_date
-                    df_casted = df_casted.withColumn(field_name, func(col(field_name), field['format']))
-                else:
-                    df_casted = df_casted.withColumn(field_name, col(field_name).cast(spark_type_str))
+                primary_type = primary_type.lower()
+                
+                # Reemplazar strings vacíos por None para un manejo adecuado de nulos
+                df_casted[field_name].replace('', None, inplace=True)
+
+                if 'format' in field and primary_type in ['timestamp', 'date']:
+                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], format=field['format'], errors='coerce')
+                    if primary_type == 'date':
+                        df_casted[field_name] = pd.to_datetime(df_casted[field_name]).dt.date
+                elif primary_type == 'timestamp':
+                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], errors='coerce')
+                elif primary_type == 'date':
+                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], errors='coerce').dt.date
+                elif primary_type in ['double', 'float']:
+                    df_casted[field_name] = pd.to_numeric(df_casted[field_name], errors='coerce')
+                    if primary_type == 'float':
+                       df_casted[field_name] = df_casted[field_name].astype('float32')
+                elif primary_type in ['int32', 'long']:
+                    numeric_series = pd.to_numeric(df_casted[field_name], errors='coerce').dropna()
+                    dtype = 'Int32' if primary_type == 'int32' else 'Int64'
+                    df_casted[field_name] = numeric_series.astype(dtype)
+                elif primary_type == 'boolean':
+                    df_casted[field_name] = df_casted[field_name].astype('boolean')
+                elif primary_type == 'string':
+                    df_casted[field_name] = df_casted[field_name].astype('string')
+            
+            # Aplicar padding a columnas de partición (si existen)
             potential_padding_columns = ['partition_data_month_id', 'partition_data_day_id']
             for column_name in partition_columns:
                 if column_name in df_casted.columns and column_name in potential_padding_columns:
-                    df_casted = df_casted.withColumn(column_name, lpad(col(column_name), 2, '0'))
+                    df_casted[column_name] = df_casted[column_name].astype(str).str.zfill(2)
+
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando archivos...', 'percentage': 66}
-            spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "false")
-            result_pandas_df = df_casted.toPandas()
-            spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-            for col_name in result_pandas_df.columns:
-                if result_pandas_df[col_name].dtype == 'object':
-                    is_decimal_col = result_pandas_df[col_name].dropna().apply(lambda x: isinstance(x, Decimal)).any()
-                    if is_decimal_col:
-                        result_pandas_df[col_name] = result_pandas_df[col_name].apply(lambda x: float(x) if x is not None else None)
-            result_pandas_df.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
+
+            # Guardar en SQLite para la vista previa
+            df_casted.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
+            
+            # Guardar como Parquet particionado
             output_partitioned_path = os.path.join(output_partitioned_base, parquet_name)
-            writer_part = df_casted.coalesce(1).write.mode('overwrite')
-            if partition_columns: writer_part = writer_part.partitionBy(*partition_columns)
-            writer_part.parquet(output_partitioned_path)
+            if os.path.exists(output_partitioned_path):
+                shutil.rmtree(output_partitioned_path)
+
+            write_options = {'path': output_partitioned_path, 'engine': 'pyarrow', 'index': False}
+            if partition_columns:
+                write_options['partition_cols'] = partition_columns
+            
+            df_casted.to_parquet(**write_options)
+            
+            # Renombrar archivos para coincidir con el comportamiento original de Spark
             for dirpath, _, filenames in os.walk(output_partitioned_path):
-                if '_SUCCESS' in filenames: os.remove(os.path.join(dirpath, '_SUCCESS'))
                 for filename in filenames:
-                    if filename.startswith('part-'):
+                    if filename.endswith('.parquet'):
                         os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet"))
                         break
+            
             job_status[session_id]['progress'][parquet_name] = {'status': 'Completado', 'percentage': 100}
         
         conn.close()
         
-        for table in selected_parquets:
-            job_status[session_id]['progress'][table] = {'status': 'Completado', 'percentage': 100}
+        # Esperar un momento para que la UI se actualice
         time.sleep(1) 
         
+        # Crear archivo ZIP con los resultados
         shutil.make_archive(os.path.join(session_path, "resultado_particionado"), 'zip', output_partitioned_base)
         
         job_status[session_id]['tables'] = selected_parquets
         job_status[session_id]['overall_status'] = 'completed'
         
+        # Guardar el estado final en un archivo
         status_file_path = os.path.join(session_path, 'status.json')
         with open(status_file_path, 'w') as f:
             json.dump(job_status[session_id], f)
@@ -121,7 +150,7 @@ def background_casting_job(session_data):
         with open(status_file_path, 'w') as f:
             json.dump(job_status[session_id], f)
 
-# --- RUTAS DE LA APLICACIÓN ---
+# --- RUTAS DE LA APLICACIÓN (Sin cambios) ---
 def get_db_path(session_id):
     return os.path.join(app.config['SESSION_FOLDER'], f"{session_id}.db")
 
@@ -239,7 +268,7 @@ def upload_schemas():
                 if missing_in_source:
                     all_valid = False
                     session['schema_status'][parquet_name] = 'error'
-                    error_html = '<strong>Error:...</strong><ul>'
+                    error_html = '<strong>Columnas del esquema no se encuentran en el Excel:</strong><ul>'
                     for field in sorted(list(missing_in_source)):
                         error_html += f'<li>- {field}</li>'
                     error_html += '</ul>'
@@ -259,13 +288,21 @@ def upload_schemas():
                 validation_passed=True
             )
         else:
-            return redirect(url_for('upload_schemas'))
+            # Si hay errores, simplemente renderiza la misma página para mostrarlos
+            return render_template(
+                'upload_schemas.html',
+                parquets=selected_parquets,
+                schema_status=session.get('schema_status', {}),
+                schema_errors=session.get('schema_errors', {})
+            )
+    
     return render_template(
         'upload_schemas.html',
         parquets=selected_parquets,
         schema_status=session.get('schema_status', {}),
         schema_errors=session.get('schema_errors', {})
     )
+
 @app.route('/start_processing', methods=['POST'])
 def start_processing():
     session_id = session.get('session_id')
@@ -274,6 +311,7 @@ def start_processing():
     thread = threading.Thread(target=background_casting_job, args=(session.copy(),))
     thread.start()
     return jsonify({'status': 'ok', 'message': 'Proceso iniciado.'})
+
 @app.route('/job_progress')
 def job_progress():
     session_id = session.get('session_id')
@@ -281,6 +319,7 @@ def job_progress():
         return jsonify({'status': 'error', 'message': 'Sesión no válida'}), 400
     status = job_status.get(session_id, {'overall_status': 'not_found'})
     return jsonify(status)
+
 @app.route('/results')
 def show_results():
     session_id = session.get('session_id')
@@ -299,19 +338,7 @@ def show_results():
     else:
         flash("Tu sesión ha expirado o el proceso no finalizó correctamente.", "warning")
         return redirect(url_for('casteo_index'))
-@app.route('/get_raw_data_preview/<table_name>')
-def get_raw_data_preview(table_name):
-    session_id = session.get('session_id')
-    if not session_id:
-        return jsonify({"error": "Sesión no válida"}), 404
-    raw_csv_path = os.path.join(app.config['SESSION_FOLDER'], session_id, 'sin_castear_csv', f"{table_name}.csv")
-    try:
-        if not os.path.exists(raw_csv_path):
-            return jsonify({"error": f"No se encontró el archivo de datos crudos para la tabla {table_name}"}), 404
-        df = pd.read_csv(raw_csv_path, dtype=str).head(10)
-        return jsonify({"html": df.to_html(classes='table table-bordered table-sm', index=False)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
 @app.route('/get_table_schema/<table_name>')
 def get_table_schema(table_name):
     session_id = session.get('session_id')
@@ -327,6 +354,7 @@ def get_table_schema(table_name):
             if field_name: schema_info.append((field_name, primary_type))
         return jsonify({"schema": schema_info})
     except Exception as e: return jsonify({"error": str(e)}), 500
+
 @app.route('/get_table_preview/<table_name>')
 def get_table_preview(table_name):
     session_id = session.get('session_id')
@@ -338,6 +366,7 @@ def get_table_preview(table_name):
         conn.close()
         return jsonify({"html": df.to_html(classes='table table-bordered table-sm', index=False)})
     except Exception as e: return jsonify({"error": str(e)}), 500
+
 @app.route('/download_selected_parquets', methods=['POST'])
 def download_selected_parquets():
     session_id = session.get('session_id')
@@ -361,6 +390,7 @@ def download_selected_parquets():
         return send_file(zip_full_path, as_attachment=True, download_name='parquets_consolidados.zip', mimetype='application/zip')
     finally:
         shutil.rmtree(temp_zip_dir, ignore_errors=True)
+
 @app.route('/download/partitioned_zip')
 def download_partitioned_zip():
     session_id = session.get('session_id')
