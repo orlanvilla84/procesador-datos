@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Panel de Procesamiento</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        .progress-bar {
+            transition: width 0.6s ease;
+        }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <div class="card shadow-lg">
+        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h2 class="mb-0">Panel de Procesamiento</h2>
+            <a href="{{ url_for('reset') }}" class="btn btn-sm btn-light disabled" id="reset-button">Empezar de Nuevo</a>
+        </div>
+        <div class="card-body p-4 p-md-5">
+            <div class="row justify-content-center">
+                <div class="col-lg-11">
+                    <div id="initial-message" class="alert alert-success text-center">
+                        <i class="bi bi-check-circle-fill"></i> ¡Validación completada con éxito! Presiona "Iniciar Proceso" para comenzar el casteo.
+                    </div>
+                    <div id="error-message-area" class="alert alert-danger" style="display: none;"></div>
+
+                    <h5 class="mt-4 text-center">Progreso de Tablas:</h5>
+                    
+                    <div id="progress-container" class="row g-3 mt-2">
+                        {% for table in tables %}
+                        <div class="col-12 col-md-6 col-lg-4">
+                        <div class="p-3 border rounded h-100">
+                                <h6 class="text-primary text-truncate" title="{{ table }}">{{ table }}</h6>
+                                <div class="progress" style="height: 25px;">
+                                    <div id="progress-bar-{{ table }}" class="progress-bar progress-bar-striped progress-bar-animated fs-6" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+                                </div>
+                                <small id="status-text-{{ table }}" class="text-muted d-block mt-1">Pendiente</small>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+
+                    <div class="text-center mt-5">
+                        <button id="process-button" class="btn btn-primary btn-lg px-5">
+                            <i class="bi bi-gear-fill"></i> Iniciar Proceso
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const processButton = document.getElementById('process-button');
+    const resetButton = document.getElementById('reset-button');
+    const initialMessage = document.getElementById('initial-message');
+    const errorMessageArea = document.getElementById('error-message-area');
+
+    let isProcessing = false;
+
+    function checkProgress() {
+        if (!isProcessing) return;
+
+        fetch('/job_progress')
+            .then(response => response.json())
+            .then(data => {
+                if (data.overall_status === 'running') {
+                    for (const [table, statusInfo] of Object.entries(data.progress)) {
+                        const progressBar = document.getElementById(`progress-bar-${table}`);
+                        const statusText = document.getElementById(`status-text-${table}`);
+                        if (progressBar && statusText) {
+                            progressBar.style.width = statusInfo.percentage + '%';
+                            progressBar.textContent = statusInfo.percentage > 10 ? statusInfo.percentage + '%' : '';
+                            statusText.textContent = statusInfo.status;
+                        }
+                    }
+                    setTimeout(checkProgress, 1500);
+                } else if (data.overall_status === 'completed') {
+                    isProcessing = false;
+                    for (const [table, statusInfo] of Object.entries(data.progress)) {
+                        const progressBar = document.getElementById(`progress-bar-${table}`);
+                        const statusText = document.getElementById(`status-text-${table}`);
+                        progressBar.style.width = '100%';
+                        progressBar.textContent = '100%';
+                        progressBar.classList.remove('progress-bar-animated', 'progress-bar-striped');
+                        progressBar.classList.add('bg-success');
+                        statusText.textContent = 'Completado';
+                    }
+                    processButton.innerHTML = '<i class="bi bi-check-circle-fill"></i> Ver Resultados';
+                    processButton.disabled = false;
+                    processButton.classList.remove('btn-primary');
+                    processButton.classList.add('btn-success');
+                    processButton.onclick = () => { window.location.href = "{{ url_for('show_results') }}"; };
+                    resetButton.classList.remove('disabled');
+                } else if (data.overall_status === 'failed') {
+                    isProcessing = false;
+                    errorMessageArea.innerHTML = '<strong>Error en el proceso:</strong><pre class="mt-2">' + data.error + '</pre>';
+                    errorMessageArea.style.display = 'block';
+                    processButton.innerHTML = '<i class="bi bi-x-circle-fill"></i> Fallo en el Proceso';
+                    processButton.disabled = true;
+                    processButton.classList.remove('btn-primary');
+                    processButton.classList.add('btn-danger');
+                    resetButton.classList.remove('disabled');
+                }
+            })
+            .catch(err => {
+                console.error("Error al verificar el progreso:", err);
+                isProcessing = false;
+            });
+    }
+
+    processButton.addEventListener('click', () => {
+        if (isProcessing || processButton.textContent.includes('Ver Resultados')) return;
+
+        isProcessing = true;
+        processButton.disabled = true;
+        processButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Procesando...';
+        initialMessage.style.display = 'none';
+        resetButton.classList.add('disabled');
+
+        fetch('/start_processing', { method: 'POST' })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    setTimeout(checkProgress, 1000);
+                } else {
+                    isProcessing = false;
+                    errorMessageArea.textContent = 'Error al iniciar el proceso: ' + data.message;
+                    errorMessageArea.style.display = 'block';
+                    processButton.disabled = false;
+                    processButton.innerHTML = '<i class="bi bi-gear-fill"></i> Iniciar Proceso';
+                }
+            })
+            .catch(err => {
+                console.error("Error al iniciar el proceso:", err);
+                isProcessing = false;
+            });
+    });
+</script>
+</body>
+</html>

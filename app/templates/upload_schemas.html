@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Paso 3: Cargar y Validar Esquemas</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        .progress-bar { transition: width 0.6s ease; }
+        .hidden { display: none; }
+        .btn.disabled {
+            pointer-events: none;
+            opacity: 0.65;
+        }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <div class="card shadow-lg">
+        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h2 id="page-title" class="mb-0">Paso 3: Cargar y Validar Esquemas</h2>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-sm btn-light" id="home-button">
+                <i class="bi bi-house-door-fill"></i> Inicio
+            </a>
+        </div>
+        <div class="card-body p-4 p-md-5">
+            
+            <form method="post" enctype="multipart/form-data" id="main-validation-form">
+                
+                <div id="instructions-container">
+                    <p id="instructions" class="text-muted">Sube un archivo de esquema (`.schema`) para cada tabla. El sistema validará que las columnas coincidan con tu Excel.</p>
+                </div>
+
+                {% if schema_errors %}
+                <div class="row justify-content-center">
+                    <div class="col-12 col-lg-10">
+                        <div class="p-3 mb-4 border rounded bg-light">
+                            <h5 class="mb-2"><i class="bi bi-file-earmark-excel-fill text-success"></i> Opción General: Actualizar Archivo Excel</h5>
+                            <p class="small text-muted mb-2">Se ha detectado un error. Si crees que el problema está en el archivo Excel, puedes subir una nueva versión aquí para todas las tablas.</p>
+                            <div class="input-group">
+                                <input type="file" class="form-control" name="new_excel_file" accept=".xlsx, .xls">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <hr>
+                {% endif %}
+                
+                <h5 class="mb-3">Esquemas por Tabla:</h5>
+                <div class="row g-3">
+                    {% for parquet in parquets %}
+                    <div class="col-12 col-md-6 col-lg-4 d-flex">
+                        <div class="p-3 rounded w-100 {% if schema_status.get(parquet) == 'validated' %} border border-success {% elif schema_status.get(parquet) in ['error', 'missing'] %} border border-danger {% else %} border {% endif %}">
+                            
+                            <div class="d-flex justify-content-between align-items-center">
+                                <h6 class="mb-0 text-primary text-truncate" title="{{ parquet }}">{{ parquet }}</h6>
+                                {% if schema_status.get(parquet) == 'validated' %}<span class="badge bg-success"><i class="bi bi-check-circle-fill"></i> Validado</span>
+                                {% elif schema_status.get(parquet) in ['error', 'missing'] %}<span class="badge bg-danger"><i class="bi bi-exclamation-triangle-fill"></i> Error</span>
+                                {% else %}<span class="badge bg-secondary">Pendiente</span>{% endif %}
+                            </div><hr class="my-2">
+                            
+                            <div class="upload-section">
+                                <label for="schema_for_{{ parquet }}" class="form-label small">Selecciona el archivo `.schema`:</label>
+                                <input class="form-control form-control-sm" type="file" name="schema_for_{{ parquet }}" id="schema_for_{{ parquet }}" accept=".schema">
+                            </div>
+
+                            <div class="progress-section hidden">
+                                <div class="progress" style="height: 25px;">
+                                    <div id="progress-bar-{{ parquet }}" class="progress-bar progress-bar-striped progress-bar-animated fs-6" role="progressbar" style="width: 0%;"></div>
+                                </div>
+                                <small id="status-text-{{ parquet }}" class="text-muted d-block mt-1">Pendiente</small>
+                            </div>
+
+                            {% if schema_errors.get(parquet) %}
+                                <div class="alert alert-danger p-2 mt-2 small d-flex justify-content-between align-items-center">
+                                    <span>
+                                        {% if schema_status.get(parquet) == 'missing' %}
+                                            <strong>Error: Falta el esquema</strong>
+                                        {% elif "columnas del esquema no se encuentran en el Excel" in schema_errors[parquet] %}
+                                            <strong>Error: Faltan columnas</strong>
+                                        {% else %}
+                                            <strong>Error: Revisar detalles</strong>
+                                        {% endif %}
+                                    </span>
+                                    <button type="button" class="btn btn-danger btn-sm" data-bs-toggle="modal" data-bs-target="#errorModal-{{ loop.index }}">
+                                        Ver Detalles
+                                    </button>
+                                </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                <div class="text-center mt-5">
+                    <button id="main-action-button" type="submit" form="main-validation-form" class="btn btn-lg btn-success px-5">
+                       <i class="bi bi-arrow-repeat"></i> Validar Cambios y Continuar
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{% for parquet in parquets %}{% if schema_errors.get(parquet) %}
+<div class="modal fade" id="errorModal-{{ loop.index }}" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+<div class="modal-header"><h5 class="modal-title">Detalles del Error: {{ parquet }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+<div class="modal-body">{{ schema_errors[parquet] | safe }}</div>
+<div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button></div>
+</div></div></div>
+{% endif %}{% endfor %}
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    const mainButton = document.getElementById('main-action-button');
+    const homeButton = document.getElementById('home-button');
+    let isProcessing = false;
+    
+    document.addEventListener('DOMContentLoaded', function () {
+        const validationPassed = {{ validation_passed|default('false')|lower }};
+        if (validationPassed) {
+            document.getElementById('page-title').textContent = 'Paso 4: Procesar Archivos';
+            document.getElementById('instructions-container').innerHTML = '<div class="alert alert-success text-center"><i class="bi bi-check-circle-fill"></i> ¡Validación completada! Presiona "Iniciar Proceso" para comenzar el casteo.</div>';
+            document.querySelectorAll('.upload-section').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.progress-section').forEach(el => el.classList.remove('hidden'));
+            mainButton.innerHTML = '<i class="bi bi-gear-fill"></i> Iniciar Proceso';
+            mainButton.classList.remove('btn-success');
+            mainButton.classList.add('btn-primary');
+            mainButton.removeAttribute('type');
+            mainButton.addEventListener('click', startProcessing);
+        }
+    });
+
+    function startProcessing() {
+        if (isProcessing) return;
+        isProcessing = true;
+        mainButton.disabled = true;
+        mainButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Procesando...';
+        homeButton.classList.add('disabled');
+        fetch('/start_processing', { method: 'POST' })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    setTimeout(checkProgress, 1000);
+                } else {
+                    alert('Error al iniciar el proceso: ' + data.message);
+                    isProcessing = false;
+                }
+            });
+    }
+
+    function checkProgress() {
+        if (!isProcessing) return;
+        fetch('/job_progress')
+            .then(response => response.json())
+            .then(data => {
+                if (data.progress) {
+                    for (const [table, info] of Object.entries(data.progress)) {
+                        const progressBar = document.getElementById(`progress-bar-${table}`);
+                        const statusText = document.getElementById(`status-text-${table}`);
+                        if (progressBar && statusText) {
+                            progressBar.style.width = info.percentage + '%';
+                            progressBar.textContent = info.percentage > 10 ? info.percentage + '%' : '';
+                            statusText.textContent = info.status;
+                            if (info.percentage === 100) {
+                                progressBar.classList.remove('progress-bar-animated', 'progress-bar-striped');
+                                progressBar.classList.add('bg-success');
+                            }
+                        }
+                    }
+                }
+                if (data.overall_status === 'completed') {
+                    isProcessing = false;
+                    mainButton.innerHTML = '<i class="bi bi-check-circle-fill"></i> Ver Resultados';
+                    mainButton.disabled = false;
+                    mainButton.classList.remove('btn-primary');
+                    mainButton.classList.add('btn-success');
+                    mainButton.onclick = () => { window.location.href = "{{ url_for('show_results') }}"; };
+                    homeButton.classList.remove('disabled');
+                } else if (data.overall_status === 'failed') {
+                    isProcessing = false;
+                    document.getElementById('instructions-container').innerHTML = `<div class="alert alert-danger"><strong>Error en el proceso:</strong><pre class="mt-2">${data.error}</pre></div>`;
+                    mainButton.innerHTML = '<i class="bi bi-x-circle-fill"></i> Proceso Fallido';
+                    mainButton.disabled = true;
+                    mainButton.classList.add('btn-danger');
+                    homeButton.classList.remove('disabled');
+                } else {
+                    setTimeout(checkProgress, 1500);
+                }
+            });
+    }
+</script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Automatización de Tareas</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+        .service-card {
+            text-decoration: none;
+            color: inherit;
+            transition: all 0.3s ease;
+            border: 1px solid #dee2e6;
+        }
+        .service-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+            border-color: #0d6efd;
+        }
+        .service-card .card-body i {
+            font-size: 3rem;
+            transition: all 0.3s ease;
+        }
+        .service-card:hover .card-body i {
+            transform: scale(1.1);
+            color: #0d6efd;
+        }
+        .badge-soon {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+        }
+    </style>
+</head>
+<body>
+<div class="container py-5">
+    <div class="text-center mb-5">
+        <h1 class="display-4">Automatización Tareas para Datos</h1>
+        <p class="lead text-muted">Selecciona un servicio para comenzar</p>
+    </div>
+
+    <div class="row g-4 justify-content-center">
+        <div class="col-md-6 col-lg-4">
+            <a href="{{ url_for('casteo_index') }}" class="service-card">
+                <div class="card h-100 text-center">
+                    <div class="card-body p-4">
+                        <i class="bi bi-file-earmark-arrow-down-fill text-primary mb-3"></i>
+                        <h5 class="card-title">Obtener Muestras</h5>
+                        <p class="card-text text-muted">Procesa, valida y castea datos desde un archivo Excel a formato Parquet.</p>
+                    </div>
+                </div>
+            </a>
+        </div>
+
+        <div class="col-md-6 col-lg-4">
+            <a href="#" class="service-card" onclick="alert('Este servicio estará disponible próximamente.'); return false;">
+                <div class="card h-100 text-center">
+                    <span class="badge bg-secondary badge-soon">Próximamente</span>
+                    <div class="card-body p-4">
+                        <i class="bi bi-table text-muted mb-3"></i>
+                        <h5 class="card-title text-muted">Visualizador de Parquets</h5>
+                        <p class="card-text text-muted">Explora y consulta el contenido de archivos Parquet almacenados.</p>
+                    </div>
+                </div>
+            </a>
+        </div>
+
+        <div class="col-md-6 col-lg-4">
+            <a href="#" class="service-card" onclick="alert('Este servicio estará disponible próximamente.'); return false;">
+                 <div class="card h-100 text-center">
+                    <span class="badge bg-secondary badge-soon">Próximamente</span>
+                    <div class="card-body p-4">
+                        <i class="bi bi-shield-check text-muted mb-3"></i>
+                        <h5 class="card-title text-muted">Validación de Mallas</h5>
+                        <p class="card-text text-muted">Valida la estructura y contenido de mallas de información contra reglas definidas.</p>
+                    </div>
+                </div>
+            </a>
+        </div>
+    </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

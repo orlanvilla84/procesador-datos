@@ -1,0 +1,7 @@
+flask
+pyspark==3.5.1
+pandas==2.2.2
+openpyxl
+setuptools
+gunicorn
+pyarrow

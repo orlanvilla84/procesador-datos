@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Obtener Muestras</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <div class="card shadow-lg">
+        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h2 id="page-step-title" class="mb-0">Paso 1: Cargar Archivo Excel</h2>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-sm btn-light">
+                <i class="bi bi-house-door-fill"></i> Inicio
+            </a>
+        </div>
+        <div id="upload-section">
+            <div class="card-body p-4 p-md-5">
+                <p class="text-center text-muted">Selecciona el archivo Excel (`.xlsx` o `.xls`) que contiene las tablas que deseas procesar.</p>
+                <div id="error-message-upload" class="alert alert-danger hidden"></div>
+                
+                <div class="row justify-content-center mt-4">
+                    <div class="col-md-10 col-lg-8">
+                        <div class="mb-3">
+                            <input class="form-control form-control-lg" type="file" id="excel-file-input" accept=".xlsx, .xls">
+                        </div>
+                    </div>
+                </div>
+                <div id="progress-wrapper" class="row justify-content-center mt-3 hidden">
+                    <div class="col-md-10 col-lg-8">
+                        <div class="progress" style="height: 25px;">
+                            <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="select-tables-section" class="hidden">
+            <div class="card-body p-4 p-md-5">
+                <p class="text-muted">Carga completada. Selecciona las tablas que deseas procesar con un esquema.</p>
+                <form action="{{ url_for('select_parquets') }}" method="post">
+                    <div id="tables-grid" class="row g-3 mt-3">
+                        </div>
+                    <div class="text-center mt-5">
+                        <button type="submit" class="btn btn-primary btn-lg">
+                            Cargar Esquemas <i class="bi bi-arrow-right"></i>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.getElementById('excel-file-input').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const uploadSection = document.getElementById('upload-section');
+    const selectTablesSection = document.getElementById('select-tables-section');
+    const progressWrapper = document.getElementById('progress-wrapper');
+    const progressBar = document.getElementById('progress-bar');
+    const tablesGrid = document.getElementById('tables-grid');
+    const errorMessage = document.getElementById('error-message-upload');
+    const pageTitle = document.getElementById('page-step-title'); // Obtenemos el título
+
+    progressWrapper.classList.remove('hidden');
+    progressBar.style.width = '0%';
+    progressBar.textContent = '0%';
+    errorMessage.classList.add('hidden');
+
+    const formData = new FormData();
+    formData.append('excel_file', file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', "{{ url_for('upload_and_process_excel') }}", true);
+
+    xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+            const percentComplete = Math.round((e.loaded / e.total) * 100);
+            progressBar.style.width = percentComplete + '%';
+            progressBar.textContent = percentComplete + '%';
+        }
+    };
+
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            progressBar.classList.remove('progress-bar-animated');
+            progressBar.classList.add('bg-success');
+            
+            const response = JSON.parse(xhr.responseText);
+
+            if (response.status === 'success') {
+                let tablesHtml = '';
+                response.tables.forEach((table, index) => {
+                    tablesHtml += `
+                        <div class="col-12 col-md-6 col-lg-4">
+                            <div class="form-check border rounded-3 p-3 h-100">
+                                <input class="form-check-input" type="checkbox" name="parquet_checkbox" value="${table}" id="check-${index}">
+                                <label class="form-check-label" for="check-${index}">${table}</label>
+                            </div>
+                        </div>
+                    `;
+                });
+                tablesGrid.innerHTML = tablesHtml;
+
+                setTimeout(() => {
+                    // === INICIO DEL CAMBIO: Actualizar título y cambiar vistas ===
+                    pageTitle.textContent = 'Paso 2: Seleccionar Tablas a Procesar';
+                    uploadSection.classList.add('hidden');
+                    selectTablesSection.classList.remove('hidden');
+                    // === FIN DEL CAMBIO ===
+                }, 500);
+
+            } else {
+                errorMessage.textContent = response.message;
+                errorMessage.classList.remove('hidden');
+                progressBar.style.width = '100%';
+                progressBar.classList.add('bg-danger');
+                progressBar.textContent = 'Error';
+            }
+        } else {
+            errorMessage.textContent = 'Error en el servidor: ' + xhr.statusText;
+            errorMessage.classList.remove('hidden');
+            progressBar.style.width = '100%';
+            progressBar.classList.add('bg-danger');
+            progressBar.textContent = 'Error';
+        }
+    };
+    
+    xhr.onerror = function() {
+        errorMessage.textContent = 'Error de red al intentar subir el archivo.';
+        errorMessage.classList.remove('hidden');
+    };
+
+    xhr.send(formData);
+});
+</script>
+</body>
+</html>

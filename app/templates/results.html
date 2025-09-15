@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Proceso Finalizado</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+</head>
+<body>
+<div class="container mt-5">
+    {% if results.overall_status == 'completed' %}
+    <div class="card shadow-lg">
+        <div class="card-header text-center bg-success text-white d-flex justify-content-between align-items-center">
+            <div style="width: 80px;"></div>
+            <h2 class="mb-0">🎉 ¡Proceso Completado!</h2>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-sm btn-light">
+                <i class="bi bi-house-door-fill"></i> Inicio
+            </a>
+        </div>
+        <div class="card-body p-4 p-md-5">
+            <p class="text-center">El casteo se completó para <strong>{{ results.tables|length }}</strong> tabla(s). Ahora puedes visualizar los resultados o descargarlos.</p>
+            <hr>
+            <div class="d-flex justify-content-center flex-wrap gap-2 my-4">
+                <div class="dropdown">
+                    <button class="btn btn-primary btn-lg dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        1. Ver Tablas Procesadas
+                    </button>
+                    <ul class="dropdown-menu">
+                        {% for table in results.tables %}
+                        <li><a class="dropdown-item" href="#" onclick="fetchTable('{{ table }}')">{{ table }}</a></li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                <div class="dropdown">
+                    <button class="btn btn-success btn-lg dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        2. Ver Tipos de Datos
+                    </button>
+                    <ul class="dropdown-menu">
+                        {% for table in results.tables %}
+                        <li><a class="dropdown-item" href="#" onclick="fetchSchema('{{ table }}')">{{ table }}</a></li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                <a href="{{ url_for('download_partitioned_zip') }}" class="btn btn-info btn-lg">3. Descargar Particionado (.zip)</a>
+                <button type="button" class="btn btn-secondary btn-lg" data-bs-toggle="modal" data-bs-target="#downloadModal">
+                    4. Descargar Parquet Consolidado
+                </button>
+                <a href="{{ url_for('reset') }}" class="btn btn-outline-dark btn-lg">✨ Procesar Nuevo Archivo</a>
+            </div>
+            <hr>
+            <div id="preview-area" class="mt-4" style="display: none;">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h3 id="preview-title" class="mb-0"></h3>
+                    <input type="text" id="column-search" onkeyup="filterColumns()" placeholder="🔎 Buscar columnas (ej: col1, col2)..." class="form-control" style="max-width: 400px;">
+                </div>
+                <div id="spinner-data" class="d-flex justify-content-center my-3"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>
+                <div id="preview-content" class="table-responsive"></div>
+            </div>
+            <div id="schema-area" class="mt-4" style="display: none;">
+                 <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h3 id="schema-title" class="mb-0"></h3>
+                    <input type="text" id="schema-search" onkeyup="filterSchema()" placeholder="🔎 Buscar columnas (ej: col1, col2)..." class="form-control" style="max-width: 400px;">
+                </div>
+                <div id="spinner-schema" class="d-flex justify-content-center my-3"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>
+                <div id="schema-content" class="table-responsive"></div>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="card shadow-lg text-center">
+        <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
+            <h2 class="mb-0">❌ Proceso Fallido</h2>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-sm btn-light">
+                <i class="bi bi-house-door-fill"></i> Inicio
+            </a>
+        </div>
+        <div class="card-body p-5">
+            <p class="lead">Ocurrió un error durante el casteo.</p>
+            <div class="alert alert-danger text-start" style="white-space: pre-wrap; font-family: monospace; font-size: 0.8rem;">
+                <strong>Detalles del error:</strong><br>{{ results.error or "No se capturó un detalle del error." }}
+            </div>
+            <div class="mt-4">
+                <a href="{{ url_for('reset') }}" class="btn btn-secondary btn-lg">Intentar de Nuevo</a>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<div class="modal fade" id="downloadModal" tabindex="-1" aria-labelledby="downloadModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="downloadModalLabel">Seleccionar Parquets para Descargar</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <form action="{{ url_for('download_selected_parquets') }}" method="POST">
+          <div class="modal-body">
+            <p>Selecciona los archivos que deseas descargar. Se comprimirán en un único archivo `.zip`.</p>
+            <div class="form-check border-bottom mb-2 pb-2">
+              <input class="form-check-input" type="checkbox" id="selectAllCheckbox">
+              <label class="form-check-label fw-bold" for="selectAllCheckbox">
+                Seleccionar Todos / Deseleccionar Todos
+              </label>
+            </div>
+            <div id="table-checkbox-list" style="max-height: 200px; overflow-y: auto;">
+                {% if results.tables %}
+                    {% for table in results.tables %}
+                    <div class="form-check">
+                      <input class="form-check-input table-checkbox" type="checkbox" name="selected_tables" value="{{ table }}" id="check-{{ table }}">
+                      <label class="form-check-label" for="check-{{ table }}">
+                        {{ table }}.parquet
+                      </label>
+                    </div>
+                    {% endfor %}
+                {% endif %}
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+            <button type="submit" class="btn btn-primary" id="downloadSelectedBtn" disabled>
+                <i class="bi bi-download"></i> Descargar Seleccionados (.zip)
+            </button>
+          </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    function filterColumns(){const t=document.getElementById("column-search"),e=document.getElementById("preview-content").querySelector("table");if(!e)return;const l=t.value.trim();e.style.width=l.length>0?"auto":"";const n=l.toLowerCase().split(",").map(t=>t.trim()).filter(t=>t.length>0),o=e.rows[0],a=e.rows;for(let i=0;i<o.cells.length;i++){const t=o.cells[i],l=(t.textContent||t.innerText).toLowerCase();let s=!0;n.length>0&&(s=n.some(t=>l.includes(t)));for(let t=0;t<a.length;t++)a[t].cells[i]&&(a[t].cells[i].style.display=s?"":"none")}}
+    function fetchTable(t){document.getElementById("schema-area").style.display="none";const e=document.getElementById("preview-area"),l=document.getElementById("preview-title"),n=document.getElementById("preview-content"),o=document.getElementById("spinner-data"),a=document.getElementById("column-search");a&&(a.value=""),e.style.display="block",l.textContent=`Vista Previa: ${t}`,n.innerHTML="",o.style.display="flex",fetch(`/get_table_preview/${t}`).then(t=>t.json()).then(t=>{o.style.display="none",t.error?n.innerHTML=`<div class="alert alert-danger">${t.error}</div>`:n.innerHTML=t.html}).catch(t=>{o.style.display="none",n.innerHTML=`<div class="alert alert-danger">Error al cargar la tabla: ${t}</div>`})}
+    function filterSchema(){const t=document.getElementById("schema-search"),e=t.value.toLowerCase().trim().split(",").map(t=>t.trim()).filter(t=>t.length>0),l=document.getElementById("schema-content").querySelector("table");if(!l)return;const n=l.querySelector("tbody").rows;for(let t=0;t<n.length;t++){const o=n[t],a=(o.cells[0].textContent||o.cells[0].innerText).toLowerCase();let s=!0;e.length>0&&(s=e.some(t=>a.includes(t))),o.style.display=s?"":"none"}}
+    function fetchSchema(t){document.getElementById("preview-area").style.display="none";const e=document.getElementById("schema-area"),l=document.getElementById("schema-title"),n=document.getElementById("schema-content"),o=document.getElementById("spinner-schema"),a=document.getElementById("schema-search");a&&(a.value=""),e.style.display="block",l.textContent=`Tipos de Datos: ${t}`,n.innerHTML="",o.style.display="flex",fetch(`/get_table_schema/${t}`).then(t=>t.json()).then(t=>{o.style.display="none",t.error?n.innerHTML=`<div class="alert alert-danger">${t.error}</div>`:(()=>{let e='<table class="table table-sm table-bordered table-striped" style="width: auto;"><thead><tr><th>Nombre de Columna</th><th>Tipo de Dato</th></tr></thead><tbody>';t.schema.forEach(t=>{e+=`<tr><td>${t[0]}</td><td>${t[1]}</td></tr>`}),e+="</tbody></table>",n.innerHTML=e})()}).catch(t=>{o.style.display="none",n.innerHTML=`<div class="alert alert-danger">Error al cargar el esquema: ${t}</div>`})}
+    document.addEventListener('DOMContentLoaded', () => {
+        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+        const tableCheckboxes = document.querySelectorAll('.table-checkbox');
+        const downloadBtn = document.getElementById('downloadSelectedBtn');
+        function updateDownloadButtonState() {
+            const checkedCount = document.querySelectorAll('.table-checkbox:checked').length;
+            downloadBtn.disabled = (checkedCount === 0);
+        }
+        if(selectAllCheckbox) {
+            selectAllCheckbox.addEventListener('change', function(event) {
+                tableCheckboxes.forEach(checkbox => {
+                    checkbox.checked = event.target.checked;
+                });
+                updateDownloadButtonState();
+            });
+        }
+        tableCheckboxes.forEach(checkbox => {
+            checkbox.addEventListener('change', updateDownloadButtonState);
+        });
+    });
+</script>
+</body>
+</html>
