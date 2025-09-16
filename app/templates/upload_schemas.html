@@ -8,9 +8,21 @@
     <style>
         .progress-bar { transition: width 0.6s ease; }
         .hidden { display: none; }
-        .btn.disabled {
+        .btn.disabled, .btn:disabled { /* Estilo mejorado para el botón desactivado */
             pointer-events: none;
             opacity: 0.65;
+        }
+
+        /* Animación de pulsación */
+        .btn-pulse {
+            animation: pulse 1.5s infinite;
+            box-shadow: 0 0 0 0 rgba(25, 135, 84, 0.7);
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(25, 135, 84, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(25, 135, 84, 0); }
         }
     </style>
 </head>
@@ -38,7 +50,7 @@
                             <h5 class="mb-2"><i class="bi bi-file-earmark-excel-fill text-success"></i> Opción General: Actualizar Archivo Excel</h5>
                             <p class="small text-muted mb-2">Se ha detectado un error. Si crees que el problema está en el archivo Excel, puedes subir una nueva versión aquí para todas las tablas.</p>
                             <div class="input-group">
-                                <input type="file" class="form-control" name="new_excel_file" accept=".xlsx, .xls">
+                                <input type="file" class="form-control schema-input" name="new_excel_file" accept=".xlsx, .xls">
                             </div>
                         </div>
                     </div>
@@ -61,7 +73,7 @@
                             
                             <div class="upload-section">
                                 <label for="schema_for_{{ parquet }}" class="form-label small">Selecciona el archivo `.schema`:</label>
-                                <input class="form-control form-control-sm" type="file" name="schema_for_{{ parquet }}" id="schema_for_{{ parquet }}" accept=".schema">
+                                <input class="form-control form-control-sm schema-input" type="file" name="schema_for_{{ parquet }}" id="schema_for_{{ parquet }}" accept=".schema">
                             </div>
 
                             <div class="progress-section hidden">
@@ -92,7 +104,7 @@
                     {% endfor %}
                 </div>
                 <div class="text-center mt-5">
-                    <button id="main-action-button" type="submit" form="main-validation-form" class="btn btn-lg btn-success px-5">
+                    <button id="main-action-button" type="submit" form="main-validation-form" class="btn btn-lg btn-success px-5 btn-pulse" disabled>
                        <i class="bi bi-arrow-repeat"></i> Validar Cambios y Continuar
                     </button>
                 </div>
@@ -118,21 +130,44 @@
     document.addEventListener('DOMContentLoaded', function () {
         const validationPassed = {{ validation_passed|default('false')|lower }};
         if (validationPassed) {
+            // Si la validación ya pasó, el botón debe estar activo
+            mainButton.disabled = false;
+            
             document.getElementById('page-title').textContent = 'Paso 4: Procesar Archivos';
             document.getElementById('instructions-container').innerHTML = '<div class="alert alert-success text-center"><i class="bi bi-check-circle-fill"></i> ¡Validación completada! Presiona "Iniciar Proceso" para comenzar el casteo.</div>';
             document.querySelectorAll('.upload-section').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.progress-section').forEach(el => el.classList.remove('hidden'));
             mainButton.innerHTML = '<i class="bi bi-gear-fill"></i> Iniciar Proceso';
             mainButton.classList.remove('btn-success');
-            mainButton.classList.add('btn-primary');
+            mainButton.classList.add('btn-primary', 'btn-pulse');
             mainButton.removeAttribute('type');
             mainButton.addEventListener('click', startProcessing);
         }
+
+        // --- INICIO DEL NUEVO SCRIPT PARA ACTIVAR/DESACTIVAR BOTÓN ---
+        const schemaInputs = document.querySelectorAll('.schema-input');
+
+        function checkButtonState() {
+            let atLeastOneFileSelected = false;
+            schemaInputs.forEach(input => {
+                if (input.value) { // .value contiene el nombre del archivo si está seleccionado
+                    atLeastOneFileSelected = true;
+                }
+            });
+            // Habilita el botón si al menos un archivo fue seleccionado, de lo contrario lo deshabilita.
+            mainButton.disabled = !atLeastOneFileSelected;
+        }
+
+        schemaInputs.forEach(input => {
+            input.addEventListener('change', checkButtonState);
+        });
+        // --- FIN DEL NUEVO SCRIPT ---
     });
 
     function startProcessing() {
         if (isProcessing) return;
         isProcessing = true;
+        mainButton.classList.remove('btn-pulse'); 
         mainButton.disabled = true;
         mainButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Procesando...';
         homeButton.classList.add('disabled');
@@ -173,7 +208,7 @@
                     mainButton.innerHTML = '<i class="bi bi-check-circle-fill"></i> Ver Resultados';
                     mainButton.disabled = false;
                     mainButton.classList.remove('btn-primary');
-                    mainButton.classList.add('btn-success');
+                    mainButton.classList.add('btn-success', 'btn-pulse');
                     mainButton.onclick = () => { window.location.href = "{{ url_for('show_results') }}"; };
                     homeButton.classList.remove('disabled');
                 } else if (data.overall_status === 'failed') {

@@ -7,6 +7,7 @@ import sqlite3
 import io
 import time
 import pandas as pd
+from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, send_file, session, jsonify, flash, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -19,93 +20,109 @@ SESSION_FOLDER = os.path.abspath('temp_sessions')
 app.config['SESSION_FOLDER'] = SESSION_FOLDER
 os.makedirs(SESSION_FOLDER, exist_ok=True)
 
-# Diccionario global para el estado de los trabajos de procesamiento
 job_status = {}
 
 # --- LÓGICA DE PROCESAMIENTO ---
+
+def parse_anything_to_datetime(value):
+    """
+    Traductor universal que convierte un valor a fecha, sin importar si es
+    un string de fecha normal (ej. '08/09/2025') o un número de serie de Excel
+    convertido a texto (ej. '45909.0').
+    """
+    if pd.isna(value):
+        return pd.NaT
+    
+    # Intento 1: Tratarlo como un número de serie de Excel
+    try:
+        # Convierte a número, ignorando errores (si ya es número, no hace nada)
+        numeric_val = pd.to_numeric(value)
+        # El origen '1899-12-30' es el estándar para convertir fechas de Excel
+        return pd.to_datetime(numeric_val, unit='D', origin='1899-12-30')
+    except (ValueError, TypeError):
+        # Intento 2: Si no es un número, tratarlo como un string de fecha normal
+        try:
+            return pd.to_datetime(value, dayfirst=True)
+        except (ValueError, TypeError):
+            # Si todo falla, es nulo
+            return pd.NaT
+
 def background_casting_job(session_data):
-    """
-    Realiza el casteo de datos en segundo plano usando Pandas.
-    Esta función reemplaza la versión original basada en PySpark.
-    """
     session_id = session_data['session_id']
     selected_parquets = session_data['selected_parquets']
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
     
-    # Inicializar el estado del trabajo
     progress_initial = {table: {'status': 'Pendiente', 'percentage': 0} for table in selected_parquets}
     job_status[session_id] = {'overall_status': 'running', 'progress': progress_initial, 'error': None}
     
     try:
-        # Definir rutas de carpetas
         raw_folder = os.path.join(session_path, 'sin_castear_csv')
         schemas_folder = os.path.join(session_path, 'esquemas')
         output_partitioned_base = os.path.join(session_path, 'output_partitioned')
         os.makedirs(output_partitioned_base, exist_ok=True)
         
-        # Conexión a la base de datos para resultados
         conn = sqlite3.connect(get_db_path(session_id))
 
         for parquet_name in selected_parquets:
             job_status[session_id]['progress'][parquet_name] = {'status': 'Casteando tipos...', 'percentage': 33}
 
-            # Cargar datos y esquema
             csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
-            df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False) # Leer todo como texto
+            df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
             
             schema_path = os.path.join(schemas_folder, f"{parquet_name}.schema")
-            with open(schema_path, 'r') as f:
+            with open(schema_path, 'r', encoding='utf-8') as f:
                 schema_data = json.load(f)
             
             partition_columns = schema_data.get('partitions', [])
             df_casted = df_raw.copy()
 
-            # Iterar sobre las columnas definidas en el esquema para castear
             for field in schema_data['fields']:
                 field_name = field['name']
                 if field_name not in df_casted.columns:
                     continue
 
-                field_type_info = field['type']
+                field_type_info = field.get('type', 'string')
                 primary_type = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
                 primary_type = primary_type.lower()
                 
-                # Reemplazar strings vacíos por None para un manejo adecuado de nulos
-                df_casted[field_name].replace('', None, inplace=True)
+                df_casted[field_name].replace({'': None, 'nan': None, 'NaT': None}, inplace=True)
 
-                if 'format' in field and primary_type in ['timestamp', 'date']:
-                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], format=field['format'], errors='coerce')
+                if primary_type in ['timestamp', 'date']:
+                    datetime_series = df_casted[field_name].apply(parse_anything_to_datetime)
                     if primary_type == 'date':
-                        df_casted[field_name] = pd.to_datetime(df_casted[field_name]).dt.date
-                elif primary_type == 'timestamp':
-                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], errors='coerce')
-                elif primary_type == 'date':
-                    df_casted[field_name] = pd.to_datetime(df_casted[field_name], errors='coerce').dt.date
+                        df_casted[field_name] = datetime_series.dt.date
+                    else:
+                        df_casted[field_name] = datetime_series
+
                 elif primary_type in ['double', 'float']:
-                    df_casted[field_name] = pd.to_numeric(df_casted[field_name], errors='coerce')
+                    clean_series = df_casted[field_name].str.replace(',', '.', regex=False).str.extract(r'(-?\d+\.?\d*)', expand=False)
+                    df_casted[field_name] = pd.to_numeric(clean_series, errors='coerce')
                     if primary_type == 'float':
                        df_casted[field_name] = df_casted[field_name].astype('float32')
+
                 elif primary_type in ['int32', 'long']:
-                    numeric_series = pd.to_numeric(df_casted[field_name], errors='coerce').dropna()
+                    numeric_series = pd.to_numeric(df_casted[field_name], errors='coerce')
                     dtype = 'Int32' if primary_type == 'int32' else 'Int64'
-                    df_casted[field_name] = numeric_series.astype(dtype)
+                    if not numeric_series.isnull().all():
+                        df_casted[field_name] = numeric_series.astype(dtype)
+                    else:
+                        df_casted[field_name] = None
+
                 elif primary_type == 'boolean':
+                    df_casted[field_name] = df_casted[field_name].str.lower().map({'true': True, 'false': False, '1': True, '0': False, 'y': True, 'n': False, 'si': True, 'no': False})
                     df_casted[field_name] = df_casted[field_name].astype('boolean')
+
                 elif primary_type == 'string':
                     df_casted[field_name] = df_casted[field_name].astype('string')
             
-            # Aplicar padding a columnas de partición (si existen)
             potential_padding_columns = ['partition_data_month_id', 'partition_data_day_id']
             for column_name in partition_columns:
                 if column_name in df_casted.columns and column_name in potential_padding_columns:
                     df_casted[column_name] = df_casted[column_name].astype(str).str.zfill(2)
 
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando archivos...', 'percentage': 66}
-
-            # Guardar en SQLite para la vista previa
             df_casted.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
             
-            # Guardar como Parquet particionado
             output_partitioned_path = os.path.join(output_partitioned_base, parquet_name)
             if os.path.exists(output_partitioned_path):
                 shutil.rmtree(output_partitioned_path)
@@ -116,29 +133,22 @@ def background_casting_job(session_data):
             
             df_casted.to_parquet(**write_options)
             
-            # Renombrar archivos para coincidir con el comportamiento original de Spark
             for dirpath, _, filenames in os.walk(output_partitioned_path):
                 for filename in filenames:
-                    if filename.endswith('.parquet'):
+                    if filename.startswith('part-'):
                         os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet"))
                         break
             
             job_status[session_id]['progress'][parquet_name] = {'status': 'Completado', 'percentage': 100}
         
         conn.close()
-        
-        # Esperar un momento para que la UI se actualice
         time.sleep(1) 
-        
-        # Crear archivo ZIP con los resultados
         shutil.make_archive(os.path.join(session_path, "resultado_particionado"), 'zip', output_partitioned_base)
-        
         job_status[session_id]['tables'] = selected_parquets
         job_status[session_id]['overall_status'] = 'completed'
         
-        # Guardar el estado final en un archivo
         status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w') as f:
+        with open(status_file_path, 'w', encoding='utf-8') as f:
             json.dump(job_status[session_id], f)
 
     except Exception as e:
@@ -147,10 +157,10 @@ def background_casting_job(session_data):
         job_status[session_id]['overall_status'] = 'failed'
         job_status[session_id]['error'] = error_info
         status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w') as f:
+        with open(status_file_path, 'w', encoding='utf-8') as f:
             json.dump(job_status[session_id], f)
 
-# --- RUTAS DE LA APLICACIÓN (Sin cambios) ---
+# --- RUTAS DE LA APLICACIÓN ---
 def get_db_path(session_id):
     return os.path.join(app.config['SESSION_FOLDER'], f"{session_id}.db")
 
@@ -201,12 +211,16 @@ def upload_and_process_excel():
             xls = pd.ExcelFile(file.stream.read())
             sheet_names = list(xls.sheet_names)
             for sheet in sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet).astype(str)
+                # Se mantiene la lectura forzada a string, que es la más segura
+                # El nuevo parser de fechas se encargará de la conversión.
+                df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
                 df.to_csv(os.path.join(raw_folder, f"{sheet}.csv"), index=False, header=True)
+
             session['parquet_files'] = sheet_names
             return jsonify({'status': 'success', 'tables': sheet_names})
         except Exception as e:
-            return jsonify({'status': 'error', 'message': f"Error al procesar el Excel: {e}"}), 500
+            import traceback
+            return jsonify({'status': 'error', 'message': f"Error al procesar el Excel: {traceback.format_exc()}"}), 500
     
     return jsonify({'status': 'error', 'message': 'Formato de archivo no válido.'}), 400
 
@@ -238,7 +252,7 @@ def upload_schemas():
                 os.makedirs(raw_folder, exist_ok=True)
                 xls = pd.ExcelFile(file.stream.read())
                 for sheet in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=sheet).astype(str)
+                    df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
                     df.to_csv(os.path.join(raw_folder, f"{sheet}.csv"), index=False, header=True)
                 session['schema_status'] = {}
         for parquet_name in selected_parquets:
@@ -253,61 +267,34 @@ def upload_schemas():
         for parquet_name in selected_parquets:
             schema_path = os.path.join(schemas_folder, f"{parquet_name}.schema")
             if not os.path.exists(schema_path):
-                all_valid = False
-                session['schema_status'][parquet_name] = 'missing'
-                session['schema_errors'][parquet_name] = "Falta subir el archivo de esquema."
-                continue
+                all_valid = False; session['schema_status'][parquet_name] = 'missing'; session['schema_errors'][parquet_name] = "Falta subir el archivo de esquema."; continue
             try:
                 csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
-                if not os.path.exists(csv_path):
-                     raise FileNotFoundError(f"La hoja '{parquet_name}' no se encontró en el archivo Excel.")
+                if not os.path.exists(csv_path): raise FileNotFoundError(f"La hoja '{parquet_name}' no se encontró en el archivo Excel.")
                 source_columns = set(pd.read_csv(csv_path, nrows=0).columns)
-                with open(schema_path, 'r') as f: schema_data = json.load(f)
+                with open(schema_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
                 schema_columns = {field['name'] for field in schema_data['fields']}
-                missing_in_source = schema_columns - source_columns
+                missing_in_source = schema_columns - set(source_columns)
                 if missing_in_source:
-                    all_valid = False
-                    session['schema_status'][parquet_name] = 'error'
+                    all_valid = False; session['schema_status'][parquet_name] = 'error'
                     error_html = '<strong>Columnas del esquema no se encuentran en el Excel:</strong><ul>'
-                    for field in sorted(list(missing_in_source)):
-                        error_html += f'<li>- {field}</li>'
-                    error_html += '</ul>'
-                    session['schema_errors'][parquet_name] = error_html
+                    for field in sorted(list(missing_in_source)): error_html += f'<li>- {field}</li>'
+                    error_html += '</ul>'; session['schema_errors'][parquet_name] = error_html
                 else:
                     session['schema_status'][parquet_name] = 'validated'
             except Exception as e:
-                all_valid = False
-                session['schema_status'][parquet_name] = 'error'
-                session['schema_errors'][parquet_name] = f"Error al procesar el archivo: {e}"
+                all_valid = False; session['schema_status'][parquet_name] = 'error'; session['schema_errors'][parquet_name] = f"Error al procesar el archivo: {e}"
         if all_valid:
-            return render_template(
-                'upload_schemas.html',
-                parquets=selected_parquets,
-                schema_status=session.get('schema_status', {}),
-                schema_errors=session.get('schema_errors', {}),
-                validation_passed=True
-            )
+            return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}), validation_passed=True)
         else:
-            # Si hay errores, simplemente renderiza la misma página para mostrarlos
-            return render_template(
-                'upload_schemas.html',
-                parquets=selected_parquets,
-                schema_status=session.get('schema_status', {}),
-                schema_errors=session.get('schema_errors', {})
-            )
+            return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}))
     
-    return render_template(
-        'upload_schemas.html',
-        parquets=selected_parquets,
-        schema_status=session.get('schema_status', {}),
-        schema_errors=session.get('schema_errors', {})
-    )
+    return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}))
 
 @app.route('/start_processing', methods=['POST'])
 def start_processing():
     session_id = session.get('session_id')
-    if not session_id:
-        return jsonify({'status': 'error', 'message': 'Sesión no válida'}), 400
+    if not session_id: return jsonify({'status': 'error', 'message': 'Sesión no válida'}), 400
     thread = threading.Thread(target=background_casting_job, args=(session.copy(),))
     thread.start()
     return jsonify({'status': 'ok', 'message': 'Proceso iniciado.'})
@@ -315,22 +302,19 @@ def start_processing():
 @app.route('/job_progress')
 def job_progress():
     session_id = session.get('session_id')
-    if not session_id:
-        return jsonify({'status': 'error', 'message': 'Sesión no válida'}), 400
+    if not session_id: return jsonify({'status': 'error', 'message': 'Sesión no válida'}), 400
     status = job_status.get(session_id, {'overall_status': 'not_found'})
     return jsonify(status)
 
 @app.route('/results')
 def show_results():
     session_id = session.get('session_id')
-    if not session_id:
-        return redirect(url_for('casteo_index'))
+    if not session_id: return redirect(url_for('casteo_index'))
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
     status_file_path = os.path.join(session_path, 'status.json')
     if os.path.exists(status_file_path):
         try:
-            with open(status_file_path, 'r') as f:
-                results_data = json.load(f)
+            with open(status_file_path, 'r', encoding='utf-8') as f: results_data = json.load(f)
             return render_template('results.html', results=results_data)
         except Exception as e:
             error_data = {'overall_status': 'failed', 'error': f'Error fatal: No se pudo leer el archivo de estado. {e}'}
@@ -346,7 +330,7 @@ def get_table_schema(table_name):
     schema_file_path = os.path.join(app.config['SESSION_FOLDER'], session_id, 'esquemas', f"{table_name}.schema")
     try:
         if not os.path.exists(schema_file_path): return jsonify({"error": f"No se encontró el archivo de esquema para la tabla {table_name}"}), 404
-        with open(schema_file_path, 'r') as f: schema_data = json.load(f)
+        with open(schema_file_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
         schema_info = []
         for field in schema_data.get('fields', []):
             field_name, field_type_info = field.get('name'), field.get('type')
