@@ -27,15 +27,16 @@ os.makedirs(SESSION_FOLDER, exist_ok=True)
 job_status = {}
 
 # --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
-# --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
 def parse_anything_to_datetime(value):
     if pd.isna(value): return pd.NaT
     try:
         numeric_val = pd.to_numeric(value)
         return pd.to_datetime(numeric_val, unit='D', origin='1899-12-30')
     except (ValueError, TypeError):
-        try: return pd.to_datetime(value, dayfirst=True)
-        except (ValueError, TypeError): return pd.NaT
+        try: 
+            return pd.to_datetime(value) # <-- LÍNEA CORREGIDA
+        except (ValueError, TypeError): 
+            return pd.NaT
 
 def background_casting_job(session_data):
     session_id = session_data['session_id']
