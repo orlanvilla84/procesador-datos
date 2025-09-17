@@ -27,6 +27,7 @@ os.makedirs(SESSION_FOLDER, exist_ok=True)
 job_status = {}
 
 # --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
+# --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
 def parse_anything_to_datetime(value):
     if pd.isna(value): return pd.NaT
     try:
@@ -61,6 +62,13 @@ def background_casting_job(session_data):
                 if field_name not in df_casted.columns: continue
                 field_type_info = field.get('type', 'string')
                 primary_type = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
+                
+                # --- INICIO DE LA CORRECCIÓN ---
+                # Si primary_type es un diccionario (ej. para tipos lógicos), extraemos el tipo base.
+                if isinstance(primary_type, dict):
+                    primary_type = primary_type.get('type', 'string')
+                # --- FIN DE LA CORRECCIÓN ---
+
                 primary_type = primary_type.lower()
                 df_casted[field_name].replace({'': None, 'nan': None, 'NaT': None}, inplace=True)
                 if primary_type in ['timestamp', 'date']:
@@ -80,10 +88,12 @@ def background_casting_job(session_data):
                     df_casted[field_name] = df_casted[field_name].str.lower().map({'true': True, 'false': False, '1': True, '0': False, 'y': True, 'n': False, 'si': True, 'no': False}).astype('boolean')
                 elif primary_type == 'string':
                     df_casted[field_name] = df_casted[field_name].astype('string')
+            
             potential_padding_columns = ['partition_data_month_id', 'partition_data_day_id']
             for column_name in partition_columns:
                 if column_name in df_casted.columns and column_name in potential_padding_columns:
                     df_casted[column_name] = df_casted[column_name].astype(str).str.zfill(2)
+            
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando archivos...', 'percentage': 66}
             df_casted.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
             output_partitioned_path = os.path.join(output_partitioned_base, parquet_name)
