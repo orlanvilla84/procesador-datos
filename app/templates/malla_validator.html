@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Validación de Mallas</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #f4f7f6; }
+        .job-box {
+            border: 1px solid #a7d9ed;
+            background-color: #e0f2f7;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 14px;
+            width: 230px;
+            text-align: center;
+            box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+            margin: 0 auto;
+        }
+        .job-box strong { font-size: 1.1em; }
+        .job-box .parent-folder { color: #0056b3; margin-bottom: 5px; }
+        .job-box .parent-folder.mismatch { color: #dc3545; font-weight: bold; }
+        .job-box .alert-icon { color: orange; font-weight: bold; cursor: help; }
+        .job-box-dummy { background-color: #fffacd; border-color: #c7d86f; }
+        .job-box-duplicate { background-color: #fff3cd; border-color: #ff8c00; position: relative; }
+        .job-box-error {
+            background-color: #f8d7da;
+            border-color: #dc3545;
+            color: #721c24;
+        }
+        .job-actions { display: flex; justify-content: center; align-items: center; gap: 8px; }
+        .view-job-icon, .view-error-icon {
+            cursor: pointer; font-size: 1.1rem; transition: color 0.2s;
+        }
+        .view-job-icon { color: #6c757d; }
+        .view-job-icon:hover { color: #0d6efd; }
+        .view-error-icon { color: #dc3545; }
+        .view-error-icon:hover { color: #a0212e; }
+        .flow-container { display: flex; flex-direction: column; align-items: center; }
+        .children-container { display: flex; justify-content: center; align-items: flex-start; gap: 20px; padding-top: 40px; }
+        #results-area { position: relative; display: flex; align-items: flex-start; gap: 30px; }
+        #main-flow-container { flex-grow: 1; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+        #dummy-jobs-container { flex: 0 0 300px; border-left: 1px solid #dee2e6; padding-left: 20px; max-height: 75vh; overflow-y: auto; padding-right: 10px; }
+        #main-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .modal-fullscreen .modal-dialog { max-width: 100%; width: 100%; height: 100%; margin: 0; }
+        .modal-fullscreen .modal-content { height: 100%; border-radius: 0; }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <div class="card shadow-lg">
+        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h2 class="mb-0">Validar Malla de Jobs</h2>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-sm btn-light">
+                <i class="bi bi-house-door-fill"></i> Inicio
+            </a>
+        </div>
+        <div class="card-body p-4 p-md-5">
+            <p class="text-center text-muted">Sube el archivo XML de la malla para visualizar y validar el flujo de dependencias.</p>
+            <div id="error-message" class="alert alert-danger" style="display: none; white-space: pre-wrap;"></div>
+            <div class="row justify-content-center mt-4">
+                <div class="col-md-10 col-lg-8">
+                    <div class="input-group">
+                        <input class="form-control form-control-lg" type="file" id="malla-file-input" accept=".xml">
+                        <button class="btn btn-success btn-lg" id="validate-button" disabled>
+                            <i class="bi bi-check-circle-fill"></i> Validar
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div id="spinner" class="text-center mt-4" style="display: none;">
+                <div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div>
+                <p class="mt-2">Procesando malla, por favor espera...</p>
+            </div>
+        </div>
+    </div>
+    
+    <div id="results-wrapper" class="mt-4" style="display: none;">
+        <div class="card shadow-lg">
+            <div class="card-header"><h3 id="results-title" class="mb-0 text-center"></h3></div>
+            <div class="card-body p-4">
+                <div id="results-area">
+                    <canvas id="main-canvas"></canvas>
+                    <div id="main-flow-container"></div>
+                    <div id="dummy-jobs-container"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="detailModal" tabindex="-1">
+    <div class="modal-dialog modal-xl"><div class="modal-content">
+        <div class="modal-header">
+            <h5 class="modal-title" id="detailModalLabel"></h5>
+            <button type="button" id="fullscreen-button" class="btn btn-outline-secondary ms-auto me-2"><i class="bi bi-arrows-fullscreen"></i></button>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+            <pre id="detailModalContent" style="background-color: #f8f9fa; border-radius: 5px; padding: 15px; white-space: pre-wrap; word-break: break-all;"></pre>
+        </div>
+    </div></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Variables
+        const fileInput = document.getElementById('malla-file-input');
+        const validateButton = document.getElementById('validate-button');
+        const errorMessage = document.getElementById('error-message');
+        const spinner = document.getElementById('spinner');
+        const resultsWrapper = document.getElementById('results-wrapper');
+        const mainFlowContainer = document.getElementById('main-flow-container');
+        const dummyJobsContainer = document.getElementById('dummy-jobs-container');
+        const resultsTitle = document.getElementById('results-title');
+        let allJobsData = {};
+        const detailModal = new bootstrap.Modal(document.getElementById('detailModal'));
+        const detailModalContent = document.getElementById('detailModalContent');
+        const detailModalLabel = document.getElementById('detailModalLabel');
+        const fullscreenButton = document.getElementById('fullscreen-button');
+
+        // Eventos
+        fileInput.addEventListener('change', () => { validateButton.disabled = !fileInput.files.length > 0; });
+        validateButton.addEventListener('click', processFile);
+        document.body.addEventListener('click', handleActionClick);
+        fullscreenButton.addEventListener('click', () => { document.getElementById('detailModal').classList.toggle('modal-fullscreen'); });
+        new ResizeObserver(drawArrows).observe(document.getElementById('results-area'));
+
+        async function processFile() {
+            errorMessage.style.display = 'none';
+            spinner.style.display = 'block';
+            resultsWrapper.style.display = 'none';
+            validateButton.disabled = true;
+            const formData = new FormData();
+            formData.append('malla_file', fileInput.files[0]);
+            try {
+                const response = await fetch('/upload_and_process_malla', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    allJobsData = result.data;
+                    renderMalla(allJobsData);
+                    resultsWrapper.style.display = 'block';
+                    resultsTitle.textContent = `Análisis de la Malla (${allJobsData.jobs.length} jobs)`;
+                } else {
+                    errorMessage.textContent = result.message;
+                    errorMessage.style.display = 'block';
+                }
+            } catch (error) {
+                errorMessage.textContent = 'Error crítico: ' + error.message;
+                errorMessage.style.display = 'block';
+            } finally {
+                spinner.style.display = 'none';
+                validateButton.disabled = false;
+            }
+        }
+
+        // --- INICIO: FUNCIÓN createJobBox CORREGIDA Y COMPLETA ---
+        function createJobBox(job) {
+            const box = document.createElement('div');
+            box.id = `job-${job.unique_id}`;
+            box.className = 'job-box';
+            
+            let parentFolderClass = 'parent-folder';
+            let alertIconHtml = '';
+            // Lógica para el PARENT_FOLDER (color rojo y alerta)
+            if (job.parent_folder_mismatch) {
+                parentFolderClass += ' mismatch';
+                alertIconHtml = `<i class="bi bi-exclamation-triangle-fill alert-icon" title="Parent folder es diferente al del job raíz"></i>`;
+            }
+
+            let errorIconHtml = '';
+            // Lógica para errores de contenido (fondo rojo y alerta)
+            if (job.errors && job.errors.length > 0) {
+                box.classList.add('job-box-error');
+                const errorCount = job.errors.length;
+                const errorTitle = `${errorCount} error${errorCount > 1 ? 'es' : ''} encontrado${errorCount > 1 ? 's' : ''}. Haz clic para ver.`;
+                errorIconHtml = `<i class="bi bi-exclamation-octagon-fill view-error-icon" data-uid="${job.unique_id}" title="${errorTitle}"></i>`;
+            }
+
+            // Se construye el HTML final con todas las validaciones
+            box.innerHTML = `
+                <div class="${parentFolderClass}">
+                    ${job.parent_folder}
+                    ${alertIconHtml}
+                </div>
+                <div class="job-actions">
+                    <strong>${job.jobname}</strong>
+                    <i class="bi bi-eye-fill view-job-icon" data-uid="${job.unique_id}" title="Ver XML"></i>
+                    ${errorIconHtml}
+                </div>
+            `;
+            
+            if (job.is_dummy) { box.classList.add('job-box-dummy'); }
+            if (job.is_duplicate) {
+                box.classList.add('job-box-duplicate');
+                box.innerHTML += `<div style="position: absolute; top: 5px; right: 5px;"><small class="badge bg-warning text-dark">Duplicado</small></div>`;
+            }
+            if (job.is_unresolved) {
+                box.classList.add('job-box-unresolved');
+                box.innerHTML = `<div>N/A</div><strong>UNRESOLVED: ${job.jobname}</strong>`;
+            }
+            return box;
+        }
+        // --- FIN: FUNCIÓN createJobBox CORREGIDA Y COMPLETA ---
+
+        function renderMalla(data) {
+            // La lógica de renderizado que define flujos y dummies permanece igual
+            mainFlowContainer.innerHTML = '';
+            dummyJobsContainer.innerHTML = '';
+            const jobsById = {};
+            data.jobs.forEach(job => jobsById[job.unique_id] = job);
+            const mainFlowIds = new Set();
+            const renderedOnCanvas = new Set();
+            const potentialRoots = data.jobs.filter(job => job.forced_by.length === 0).sort((a, b) => a.jobname.localeCompare(b.jobname));
+            const trueRoot = potentialRoots.length > 0 ? potentialRoots[0] : null;
+            
+            function buildFlow(jobId, container, rootParentFolder, isDummyFlow) {
+                if (renderedOnCanvas.has(jobId)) {
+                     container.appendChild(createJobBox({...jobsById[jobId], is_duplicate: true, is_dummy: isDummyFlow}));
+                     return;
+                }
+                renderedOnCanvas.add(jobId);
+                if (!isDummyFlow) { mainFlowIds.add(jobId); }
+
+                const job = jobsById[jobId];
+                const flow = document.createElement('div');
+                flow.className = 'flow-container';
+                flow.appendChild(createJobBox(job)); // Pasamos el job completo con sus flags
+                
+                const childrenIds = [];
+                job.forces.forEach(forceName => {
+                    const targetIds = data.name_to_id_map[forceName] || [];
+                    if (targetIds.length > 0) { childrenIds.push(...targetIds.filter(tid => jobsById[tid])); }
+                    else { childrenIds.push({ unique_id: `unresolved-${forceName}`, jobname: forceName, is_unresolved: true }); }
+                });
+
+                if (childrenIds.length > 0) {
+                    const childrenDiv = document.createElement('div');
+                    childrenDiv.className = 'children-container';
+                    childrenIds.forEach(child => {
+                        if(typeof child === 'string') {
+                            buildFlow(child, childrenDiv, rootParentFolder || job.parent_folder, isDummyFlow);
+                        } else { childrenDiv.appendChild(createJobBox(child)); }
+                    });
+                    flow.appendChild(childrenDiv);
+                }
+                container.appendChild(flow);
+            }
+            
+            mainFlowContainer.innerHTML = '<h4 class="text-center text-muted mb-3">Flujo Principal</h4>';
+            if (trueRoot) {
+                buildFlow(trueRoot.unique_id, mainFlowContainer, trueRoot.parent_folder, false);
+            } else {
+                mainFlowContainer.innerHTML += '<p class="text-center text-muted">No se encontró un job raíz para el flujo principal.</p>';
+            }
+
+            const dummyJobs = data.jobs.filter(job => !mainFlowIds.has(job.unique_id));
+            if (dummyJobs.length > 0) {
+                 dummyJobsContainer.innerHTML = '<h4 class="text-center text-muted mb-3">Jobs Dummy</h4>';
+                 const dummyGrid = document.createElement('div');
+                 dummyGrid.style.display = 'flex';
+                 dummyGrid.style.flexDirection = 'column';
+                 dummyGrid.style.gap = '15px';
+                 const dummyRoots = dummyJobs.filter(j => j.forced_by.filter(p => !mainFlowIds.has(p)).length === 0);
+                 const renderedDummies = new Set();
+                 
+                 dummyRoots.forEach(dRoot => {
+                    if(renderedDummies.has(dRoot.unique_id)) return;
+                     const orphanFlowContainer = document.createElement('div');
+                     buildFlow(dRoot.unique_id, orphanFlowContainer, trueRoot ? trueRoot.parent_folder : dRoot.parent_folder, true);
+                     dummyGrid.appendChild(orphanFlowContainer);
+                     
+                     const tempRendered = new Set();
+                     function markRendered(jobId) {
+                         if(tempRendered.has(jobId)) return;
+                         tempRendered.add(jobId); renderedDummies.add(jobId);
+                         const job = jobsById[jobId];
+                         job.forces.forEach(fname => (data.name_to_id_map[fname] || []).forEach(cid => markRendered(cid)));
+                     }
+                     markRendered(dRoot.unique_id);
+                 });
+                 
+                 dummyJobs.forEach(dummy => {
+                     if (!renderedDummies.has(dummy.unique_id)) {
+                         dummyGrid.appendChild(createJobBox({...dummy, is_dummy: true}));
+                     }
+                 });
+                 dummyJobsContainer.appendChild(dummyGrid);
+            }
+            
+            setTimeout(drawArrows, 150);
+        }
+
+        function drawArrows() {
+            const canvas = document.getElementById('main-canvas');
+            const ctx = canvas.getContext('2d');
+            const resultsArea = document.getElementById('results-area');
+            canvas.width = resultsArea.scrollWidth;
+            canvas.height = resultsArea.scrollHeight;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const containerRect = resultsArea.getBoundingClientRect();
+
+            allJobsData.jobs.forEach(parentJob => {
+                if (!parentJob.forces.length) return;
+                const parentEl = document.getElementById(`job-${parentJob.unique_id}`);
+                if (!parentEl) return;
+                parentJob.forces.forEach(forcedName => {
+                    const childrenIds = allJobsData.name_to_id_map[forcedName] || [];
+                    childrenIds.forEach(childId => {
+                        const childEl = document.getElementById(`job-${childId}`);
+                        if (parentEl && childEl) {
+                            const rect1 = parentEl.getBoundingClientRect();
+                            const rect2 = childEl.getBoundingClientRect();
+                            const startX = (rect1.left + rect1.width / 2) - containerRect.left;
+                            const startY = rect1.bottom - containerRect.top;
+                            const endX = (rect2.left + rect2.width / 2) - containerRect.left;
+                            const endY = rect2.top - containerRect.top;
+                            ctx.beginPath();
+                            ctx.moveTo(startX, startY);
+                            ctx.lineTo(endX, endY);
+                            ctx.strokeStyle = '#0d6efd';
+                            ctx.lineWidth = 2;
+                            ctx.stroke();
+                            const angle = Math.atan2(endY - startY, endX - startX);
+                            const size = 10;
+                            ctx.beginPath();
+                            ctx.moveTo(endX, endY);
+                            ctx.lineTo(endX - size * Math.cos(angle - Math.PI / 6), endY - size * Math.sin(angle - Math.PI / 6));
+                            ctx.lineTo(endX - size * Math.cos(angle + Math.PI / 6), endY - size * Math.sin(angle + Math.PI / 6));
+                            ctx.closePath();
+                            ctx.fillStyle = '#0d6efd';
+                            ctx.fill();
+                        }
+                    });
+                });
+            });
+        }
+
+        function handleActionClick(event) {
+            const targetIcon = event.target.closest('.view-job-icon, .view-error-icon');
+            if (!targetIcon) return;
+            const uid = targetIcon.getAttribute('data-uid');
+            const job = allJobsData.jobs.find(j => j.unique_id === uid);
+            if (!job) return;
+            if (targetIcon.classList.contains('view-error-icon')) {
+                detailModalLabel.textContent = `Errores en Job: ${job.jobname}`;
+                let errorHtml = '<ul class="list-group list-group-flush">';
+                job.errors.forEach(err => {
+                    errorHtml += `<li class="list-group-item"><strong>Línea ${err.line}:</strong> ${err.error}<br><code class="text-danger" style="font-size: 0.85em;">${err.content}</code></li>`;
+                });
+                errorHtml += '</ul>';
+                detailModalContent.innerHTML = errorHtml;
+            } else {
+                detailModalLabel.textContent = `Detalle del Job: ${job.jobname}`;
+                detailModalContent.textContent = job.full_xml_string;
+            }
+            detailModal.show();
+        }
+    });
+</script>
+</body>
+</html>

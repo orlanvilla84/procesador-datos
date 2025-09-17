@@ -69,12 +69,11 @@
         </div>
 
         <div class="col-md-6 col-lg-4">
-            <a href="#" class="service-card" onclick="alert('Este servicio estará disponible próximamente.'); return false;">
+            <a href="{{ url_for('malla_validator_index') }}" class="service-card">
                  <div class="card h-100 text-center">
-                    <span class="badge bg-secondary badge-soon">Próximamente</span>
                     <div class="card-body p-4">
-                        <i class="bi bi-shield-check text-muted mb-3"></i>
-                        <h5 class="card-title text-muted">Validación de Mallas</h5>
+                        <i class="bi bi-shield-check text-primary mb-3"></i>
+                        <h5 class="card-title">Validación de Mallas</h5>
                         <p class="card-text text-muted">Valida la estructura y contenido de mallas de información contra reglas definidas.</p>
                     </div>
                 </div>

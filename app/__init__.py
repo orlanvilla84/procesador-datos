@@ -10,6 +10,10 @@ import pandas as pd
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, send_file, session, jsonify, flash, send_from_directory
 from werkzeug.utils import secure_filename
+import xml.etree.ElementTree as ET
+import collections
+import hashlib
+import re
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN ---
 app = Flask(__name__)
@@ -22,145 +26,93 @@ os.makedirs(SESSION_FOLDER, exist_ok=True)
 
 job_status = {}
 
-# --- LÓGICA DE PROCESAMIENTO ---
-
+# --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
 def parse_anything_to_datetime(value):
-    """
-    Traductor universal que convierte un valor a fecha, sin importar si es
-    un string de fecha normal (ej. '08/09/2025') o un número de serie de Excel
-    convertido a texto (ej. '45909.0').
-    """
-    if pd.isna(value):
-        return pd.NaT
-    
-    # Intento 1: Tratarlo como un número de serie de Excel
+    if pd.isna(value): return pd.NaT
     try:
-        # Convierte a número, ignorando errores (si ya es número, no hace nada)
         numeric_val = pd.to_numeric(value)
-        # El origen '1899-12-30' es el estándar para convertir fechas de Excel
         return pd.to_datetime(numeric_val, unit='D', origin='1899-12-30')
     except (ValueError, TypeError):
-        # Intento 2: Si no es un número, tratarlo como un string de fecha normal
-        try:
-            return pd.to_datetime(value, dayfirst=True)
-        except (ValueError, TypeError):
-            # Si todo falla, es nulo
-            return pd.NaT
+        try: return pd.to_datetime(value, dayfirst=True)
+        except (ValueError, TypeError): return pd.NaT
 
 def background_casting_job(session_data):
     session_id = session_data['session_id']
     selected_parquets = session_data['selected_parquets']
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
-    
     progress_initial = {table: {'status': 'Pendiente', 'percentage': 0} for table in selected_parquets}
     job_status[session_id] = {'overall_status': 'running', 'progress': progress_initial, 'error': None}
-    
     try:
         raw_folder = os.path.join(session_path, 'sin_castear_csv')
         schemas_folder = os.path.join(session_path, 'esquemas')
         output_partitioned_base = os.path.join(session_path, 'output_partitioned')
         os.makedirs(output_partitioned_base, exist_ok=True)
-        
         conn = sqlite3.connect(get_db_path(session_id))
-
         for parquet_name in selected_parquets:
             job_status[session_id]['progress'][parquet_name] = {'status': 'Casteando tipos...', 'percentage': 33}
-
             csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
             df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-            
             schema_path = os.path.join(schemas_folder, f"{parquet_name}.schema")
-            with open(schema_path, 'r', encoding='utf-8') as f:
-                schema_data = json.load(f)
-            
+            with open(schema_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
             partition_columns = schema_data.get('partitions', [])
             df_casted = df_raw.copy()
-
             for field in schema_data['fields']:
                 field_name = field['name']
-                if field_name not in df_casted.columns:
-                    continue
-
+                if field_name not in df_casted.columns: continue
                 field_type_info = field.get('type', 'string')
                 primary_type = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
                 primary_type = primary_type.lower()
-                
                 df_casted[field_name].replace({'': None, 'nan': None, 'NaT': None}, inplace=True)
-
                 if primary_type in ['timestamp', 'date']:
                     datetime_series = df_casted[field_name].apply(parse_anything_to_datetime)
-                    if primary_type == 'date':
-                        df_casted[field_name] = datetime_series.dt.date
-                    else:
-                        df_casted[field_name] = datetime_series
-
+                    if primary_type == 'date': df_casted[field_name] = datetime_series.dt.date
+                    else: df_casted[field_name] = datetime_series
                 elif primary_type in ['double', 'float']:
                     clean_series = df_casted[field_name].str.replace(',', '.', regex=False).str.extract(r'(-?\d+\.?\d*)', expand=False)
                     df_casted[field_name] = pd.to_numeric(clean_series, errors='coerce')
-                    if primary_type == 'float':
-                       df_casted[field_name] = df_casted[field_name].astype('float32')
-
+                    if primary_type == 'float': df_casted[field_name] = df_casted[field_name].astype('float32')
                 elif primary_type in ['int32', 'long']:
                     numeric_series = pd.to_numeric(df_casted[field_name], errors='coerce')
                     dtype = 'Int32' if primary_type == 'int32' else 'Int64'
-                    if not numeric_series.isnull().all():
-                        df_casted[field_name] = numeric_series.astype(dtype)
-                    else:
-                        df_casted[field_name] = None
-
+                    if not numeric_series.isnull().all(): df_casted[field_name] = numeric_series.astype(dtype)
+                    else: df_casted[field_name] = None
                 elif primary_type == 'boolean':
-                    df_casted[field_name] = df_casted[field_name].str.lower().map({'true': True, 'false': False, '1': True, '0': False, 'y': True, 'n': False, 'si': True, 'no': False})
-                    df_casted[field_name] = df_casted[field_name].astype('boolean')
-
+                    df_casted[field_name] = df_casted[field_name].str.lower().map({'true': True, 'false': False, '1': True, '0': False, 'y': True, 'n': False, 'si': True, 'no': False}).astype('boolean')
                 elif primary_type == 'string':
                     df_casted[field_name] = df_casted[field_name].astype('string')
-            
             potential_padding_columns = ['partition_data_month_id', 'partition_data_day_id']
             for column_name in partition_columns:
                 if column_name in df_casted.columns and column_name in potential_padding_columns:
                     df_casted[column_name] = df_casted[column_name].astype(str).str.zfill(2)
-
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando archivos...', 'percentage': 66}
             df_casted.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
-            
             output_partitioned_path = os.path.join(output_partitioned_base, parquet_name)
-            if os.path.exists(output_partitioned_path):
-                shutil.rmtree(output_partitioned_path)
-
+            if os.path.exists(output_partitioned_path): shutil.rmtree(output_partitioned_path)
             write_options = {'path': output_partitioned_path, 'engine': 'pyarrow', 'index': False}
-            if partition_columns:
-                write_options['partition_cols'] = partition_columns
-            
+            if partition_columns: write_options['partition_cols'] = partition_columns
             df_casted.to_parquet(**write_options)
-            
             for dirpath, _, filenames in os.walk(output_partitioned_path):
+                if '_SUCCESS' in filenames: os.remove(os.path.join(dirpath, '_SUCCESS'))
                 for filename in filenames:
                     if filename.startswith('part-'):
-                        os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet"))
-                        break
-            
+                        os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet")); break
             job_status[session_id]['progress'][parquet_name] = {'status': 'Completado', 'percentage': 100}
-        
         conn.close()
         time.sleep(1) 
         shutil.make_archive(os.path.join(session_path, "resultado_particionado"), 'zip', output_partitioned_base)
         job_status[session_id]['tables'] = selected_parquets
         job_status[session_id]['overall_status'] = 'completed'
-        
         status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w', encoding='utf-8') as f:
-            json.dump(job_status[session_id], f)
-
+        with open(status_file_path, 'w', encoding='utf-8') as f: json.dump(job_status[session_id], f)
     except Exception as e:
         import traceback
         error_info = f"[{type(e).__name__}] {str(e)}\n{traceback.format_exc()}"
         job_status[session_id]['overall_status'] = 'failed'
         job_status[session_id]['error'] = error_info
         status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w', encoding='utf-8') as f:
-            json.dump(job_status[session_id], f)
+        with open(status_file_path, 'w', encoding='utf-8') as f: json.dump(job_status[session_id], f)
 
-# --- RUTAS DE LA APLICACIÓN ---
+# --- RUTAS DE LA APLICACIÓN (CASTEO Y GENERALES) ---
 def get_db_path(session_id):
     return os.path.join(app.config['SESSION_FOLDER'], f"{session_id}.db")
 
@@ -170,12 +122,12 @@ def reset():
     if session_id:
         session_folder = os.path.join(app.config['SESSION_FOLDER'], session_id)
         db_file = get_db_path(session_id)
-        shutil.rmtree(session_folder, ignore_errors=True)
+        if os.path.isdir(session_folder): shutil.rmtree(session_folder, ignore_errors=True)
         if os.path.exists(db_file):
             try: os.remove(db_file)
             except OSError: pass
     session.clear()
-    return redirect(url_for('casteo_index'))
+    return redirect(url_for('dashboard'))
 
 @app.route('/')
 def dashboard():
@@ -190,16 +142,9 @@ def upload_and_process_excel():
     session_id = session.get('session_id')
     if session_id:
         old_session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
-        old_db_path = get_db_path(session_id)
-        shutil.rmtree(old_session_path, ignore_errors=True)
-        if os.path.exists(old_db_path):
-            try: os.remove(old_db_path)
-            except OSError: pass
-    session.clear()
-
+        if os.path.isdir(old_session_path): shutil.rmtree(old_session_path, ignore_errors=True)
     if 'excel_file' not in request.files or not request.files['excel_file'].filename:
         return jsonify({'status': 'error', 'message': 'No se seleccionó ningún archivo.'}), 400
-    
     file = request.files['excel_file']
     if file and (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
         session_id = str(uuid.uuid4())
@@ -211,17 +156,12 @@ def upload_and_process_excel():
             xls = pd.ExcelFile(file.stream.read())
             sheet_names = list(xls.sheet_names)
             for sheet in sheet_names:
-                # Se mantiene la lectura forzada a string, que es la más segura
-                # El nuevo parser de fechas se encargará de la conversión.
                 df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
                 df.to_csv(os.path.join(raw_folder, f"{sheet}.csv"), index=False, header=True)
-
             session['parquet_files'] = sheet_names
             return jsonify({'status': 'success', 'tables': sheet_names})
         except Exception as e:
-            import traceback
-            return jsonify({'status': 'error', 'message': f"Error al procesar el Excel: {traceback.format_exc()}"}), 500
-    
+            return jsonify({'status': 'error', 'message': f"Error al procesar el Excel: {str(e)}"}), 500
     return jsonify({'status': 'error', 'message': 'Formato de archivo no válido.'}), 400
 
 @app.route('/select_parquets', methods=['POST'])
@@ -233,6 +173,7 @@ def select_parquets():
         return redirect(request.referrer or url_for('casteo_index'))
     return redirect(url_for('upload_schemas'))
 
+# ... (El resto de las rutas de casteo que ya funcionan bien permanecen aquí sin cambios) ...
 @app.route('/upload_schemas', methods=['GET', 'POST'])
 def upload_schemas():
     if 'selected_parquets' not in session: return redirect(url_for('casteo_index'))
@@ -288,7 +229,6 @@ def upload_schemas():
             return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}), validation_passed=True)
         else:
             return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}))
-    
     return render_template('upload_schemas.html', parquets=selected_parquets, schema_status=session.get('schema_status', {}), schema_errors=session.get('schema_errors', {}))
 
 @app.route('/start_processing', methods=['POST'])
@@ -381,3 +321,103 @@ def download_partitioned_zip():
     if not session_id: return "Error: Sesión no encontrada.", 404
     directory = os.path.join(app.config['SESSION_FOLDER'], session_id)
     return send_from_directory(directory, "resultado_particionado.zip", as_attachment=True)
+
+
+# --- LÓGICA PARA VALIDACIÓN DE MALLAS ---
+def process_malla_xml(xml_content):
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        wrapped_content = f"<DEFS>{xml_content}</DEFS>"
+        root = ET.fromstring(wrapped_content)
+
+    all_job_elements = root.findall(".//JOB")
+    if not all_job_elements:
+        raise ValueError("No se encontraron elementos <JOB> en el archivo XML.")
+
+    unique_id_to_job_info = {}
+    job_name_to_unique_ids = collections.defaultdict(list)
+
+    for i, job_elem in enumerate(all_job_elements):
+        jobname = job_elem.get("JOBNAME", "").strip()
+        parent_folder = job_elem.get("PARENT_FOLDER", "").strip()
+        
+        if jobname:
+            unique_id_base = f"{jobname}-{parent_folder}-{i}"
+            unique_id = hashlib.sha256(unique_id_base.encode()).hexdigest()
+            full_xml_string = ET.tostring(job_elem, encoding="unicode")
+            
+            errors = []
+            xml_lines = full_xml_string.splitlines()
+
+            for line_num, line in enumerate(xml_lines, 1):
+                if '.dev' in line and '<VALUE' in line:
+                    errors.append({
+                        "line": line_num, "error": "Entorno '.dev' encontrado",
+                        "content": line.strip()
+                    })
+
+            on_open_count = full_xml_string.count("<ON ")
+            on_close_count = full_xml_string.count("</ON>")
+            if on_open_count != on_close_count:
+                errors.append({
+                    "line": "?", "error": "Etiquetas <ON> no coinciden",
+                    "content": f"Aperturas: {on_open_count}, Cierres: {on_close_count}"
+                })
+            
+            if not full_xml_string.strip().endswith('</JOB>'):
+                 errors.append({"line": len(xml_lines), "error": "Falta etiqueta de cierre </JOB>", "content": "El bloque del job no termina correctamente."})
+
+            unique_id_to_job_info[unique_id] = {
+                "jobname": jobname, "parent_folder": parent_folder,
+                "forces": [], "forced_by": [], "full_xml_string": full_xml_string,
+                "unique_id": unique_id, "unique_id_short": unique_id[-6:],
+                "errors": errors, "parent_folder_mismatch": False
+            }
+            job_name_to_unique_ids[jobname].append(unique_id)
+
+    for uid, info in unique_id_to_job_info.items():
+        job_elem = ET.fromstring(info["full_xml_string"])
+        for doforcejob_elem in job_elem.findall(".//DOFORCEJOB"):
+            forced_job_name = doforcejob_elem.get("NAME", "").strip()
+            if forced_job_name:
+                info["forces"].append(forced_job_name)
+                for target_uid in job_name_to_unique_ids.get(forced_job_name, []):
+                    unique_id_to_job_info[target_uid]["forced_by"].append(uid)
+    
+    potential_roots = sorted([job for job in unique_id_to_job_info.values() if not job["forced_by"]], key=lambda j: j['jobname'])
+    root_parent_folder = potential_roots[0]['parent_folder'] if potential_roots else None
+
+    if root_parent_folder:
+        for job in unique_id_to_job_info.values():
+            if job['parent_folder'] != root_parent_folder:
+                job['parent_folder_mismatch'] = True
+
+    return {
+        "jobs": list(unique_id_to_job_info.values()),
+        "name_to_id_map": dict(job_name_to_unique_ids)
+    }
+
+@app.route('/malla')
+def malla_validator_index():
+    return render_template('malla_validator.html')
+
+@app.route('/upload_and_process_malla', methods=['POST'])
+def upload_and_process_malla():
+    if 'malla_file' not in request.files or not request.files['malla_file'].filename:
+        return jsonify({'status': 'error', 'message': 'No se seleccionó ningún archivo.'}), 400
+    
+    file = request.files['malla_file']
+    if file and file.filename.endswith('.xml'):
+        try:
+            xml_content = file.read().decode('utf-8', errors='ignore')
+            processed_data = process_malla_xml(xml_content)
+            return jsonify({'status': 'success', 'data': processed_data})
+        except ET.ParseError as e:
+            error_message = f"Error de sintaxis en el XML en la línea {e.lineno}, columna {e.offset}: {e.msg}"
+            return jsonify({'status': 'error', 'message': error_message}), 400
+        except Exception as e:
+            import traceback
+            return jsonify({'status': 'error', 'message': f'Error al procesar el archivo: {traceback.format_exc()}'}), 500
+    
+    return jsonify({'status': 'error', 'message': 'Formato de archivo no válido. Se esperaba un .xml'}), 400
