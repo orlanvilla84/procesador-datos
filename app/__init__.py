@@ -4,7 +4,6 @@ import shutil
 import uuid
 import threading
 import sqlite3
-import io
 import time
 import pandas as pd
 from datetime import datetime
@@ -14,8 +13,14 @@ import xml.etree.ElementTree as ET
 import collections
 import hashlib
 import re
+import decimal # <-- Importación necesaria para la corrección
 
-# --- CONFIGURACIÓN E INICIALIZACIÓN ---
+# --- IMPORTACIONES Y CONFIGURACIÓN DE PYSPARK ---
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, trim, to_date, to_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, DoubleType, FloatType, BooleanType, DateType, TimestampType, DecimalType
+
+# --- CONFIGURACIÓN E INICIALIZACIÓN DE FLASK ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'una-clave-secreta-muy-segura-12345'
 app.config['TEMPLATES_AUTO_RELOAD'] = True
@@ -25,103 +30,151 @@ app.config['SESSION_FOLDER'] = SESSION_FOLDER
 os.makedirs(SESSION_FOLDER, exist_ok=True)
 
 job_status = {}
+spark_session = None
 
-# --- LÓGICA DE PROCESAMIENTO (CASTEO) ---
-def parse_anything_to_datetime(value):
-    if pd.isna(value): return pd.NaT
+# --- FUNCIÓN PARA GESTIONAR LA SESIÓN DE SPARK (VERSIÓN ROBUSTA Y CORRECTA) ---
+def get_spark_session():
+    """
+    Inicializa y devuelve una SparkSession global.
+    Usa un bloque try-except para recrear la sesión si no está activa.
+    """
+    global spark_session
     try:
-        numeric_val = pd.to_numeric(value)
-        return pd.to_datetime(numeric_val, unit='D', origin='1899-12-30')
-    except (ValueError, TypeError):
-        try: 
-            return pd.to_datetime(value) # <-- LÍNEA CORREGIDA
-        except (ValueError, TypeError): 
-            return pd.NaT
+        _ = spark_session.version
+        print("INFO: Reutilizando SparkSession existente.")
+    except Exception:
+        print("INFO: La sesión de Spark no está activa. Creando una nueva...")
+        spark_session = SparkSession.builder \
+            .appName("FlaskCastingApp") \
+            .config("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED") \
+            .config("spark.driver.memory", "2g") \
+            .master("local[*]") \
+            .getOrCreate()
+    return spark_session
 
+# --- LÓGICA DE PROCESAMIENTO (SOLUCIÓN DEFINITIVA Y A PRUEBA DE ERRORES) ---
 def background_casting_job(session_data):
     session_id = session_data['session_id']
     selected_parquets = session_data['selected_parquets']
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
     progress_initial = {table: {'status': 'Pendiente', 'percentage': 0} for table in selected_parquets}
     job_status[session_id] = {'overall_status': 'running', 'progress': progress_initial, 'error': None}
+
     try:
+        spark = get_spark_session()
+        
         raw_folder = os.path.join(session_path, 'sin_castear_csv')
         schemas_folder = os.path.join(session_path, 'esquemas')
         output_partitioned_base = os.path.join(session_path, 'output_partitioned')
         os.makedirs(output_partitioned_base, exist_ok=True)
-        conn = sqlite3.connect(get_db_path(session_id))
+        
+        TYPE_MAP = {
+            'string': StringType(), 'int32': IntegerType(), 'long': LongType(),
+            'double': DoubleType(), 'float': FloatType(), 'boolean': BooleanType(),
+            'date': DateType(), 'timestamp': TimestampType()
+        }
+
         for parquet_name in selected_parquets:
-            job_status[session_id]['progress'][parquet_name] = {'status': 'Casteando tipos...', 'percentage': 33}
+            job_status[session_id]['progress'][parquet_name] = {'status': 'Procesando con PySpark...', 'percentage': 20}
             csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
-            df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
             schema_path = os.path.join(schemas_folder, f"{parquet_name}.schema")
-            with open(schema_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
-            partition_columns = schema_data.get('partitions', [])
-            df_casted = df_raw.copy()
+
+            with open(schema_path, 'r', encoding='utf-8') as f:
+                schema_data = json.load(f)
+
+            # Paso 1: Leer el CSV como texto plano para evitar inferencias incorrectas
+            df_raw = spark.read.csv(csv_path, header=True, inferSchema=False)
+            df_casted = df_raw
+
+            job_status[session_id]['progress'][parquet_name] = {'status': 'Aplicando tipos de datos...', 'percentage': 40}
+            
+            # Paso 2: Castear explícitamente cada columna según el esquema
             for field in schema_data['fields']:
                 field_name = field['name']
-                if field_name not in df_casted.columns: continue
-                field_type_info = field.get('type', 'string')
-                primary_type = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
-                
-                # --- INICIO DE LA CORRECCIÓN ---
-                # Si primary_type es un diccionario (ej. para tipos lógicos), extraemos el tipo base.
-                if isinstance(primary_type, dict):
-                    primary_type = primary_type.get('type', 'string')
-                # --- FIN DE LA CORRECCIÓN ---
+                if field_name not in df_casted.columns:
+                    continue
 
-                primary_type = primary_type.lower()
-                df_casted[field_name].replace({'': None, 'nan': None, 'NaT': None}, inplace=True)
-                if primary_type in ['timestamp', 'date']:
-                    datetime_series = df_casted[field_name].apply(parse_anything_to_datetime)
-                    if primary_type == 'date': df_casted[field_name] = datetime_series.dt.date
-                    else: df_casted[field_name] = datetime_series
-                elif primary_type in ['double', 'float']:
-                    clean_series = df_casted[field_name].str.replace(',', '.', regex=False).str.extract(r'(-?\d+\.?\d*)', expand=False)
-                    df_casted[field_name] = pd.to_numeric(clean_series, errors='coerce')
-                    if primary_type == 'float': df_casted[field_name] = df_casted[field_name].astype('float32')
-                elif primary_type in ['int32', 'long']:
-                    numeric_series = pd.to_numeric(df_casted[field_name], errors='coerce')
-                    dtype = 'Int32' if primary_type == 'int32' else 'Int64'
-                    if not numeric_series.isnull().all(): df_casted[field_name] = numeric_series.astype(dtype)
-                    else: df_casted[field_name] = None
-                elif primary_type == 'boolean':
-                    df_casted[field_name] = df_casted[field_name].str.lower().map({'true': True, 'false': False, '1': True, '0': False, 'y': True, 'n': False, 'si': True, 'no': False}).astype('boolean')
-                elif primary_type == 'string':
-                    df_casted[field_name] = df_casted[field_name].astype('string')
+                field_type_info = field.get('type', 'string')
+                primary_type_str = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
+                if isinstance(primary_type_str, dict):
+                    primary_type_str = primary_type_str.get('type', 'string')
+                
+                primary_type_str = primary_type_str.lower()
+                
+                # --- LÓGICA DE CASTEO FINAL Y CORRECTA ---
+                spark_type = TYPE_MAP.get(primary_type_str)
+                
+                if primary_type_str == 'date':
+                    df_casted = df_casted.withColumn(field_name, to_date(trim(col(field_name))))
+                
+                elif primary_type_str == 'timestamp':
+                    df_casted = df_casted.withColumn(field_name, to_timestamp(trim(col(field_name))))
+                
+                elif primary_type_str.startswith('decimal'):
+                    match = re.search(r'decimal\((\d+),?\s*(\d+)?\)', primary_type_str)
+                    if match:
+                        precision = int(match.group(1))
+                        scale = int(match.group(2) or 0)
+                        df_casted = df_casted.withColumn(field_name, col(field_name).cast(DecimalType(precision, scale)))
+                
+                elif spark_type:
+                    df_casted = df_casted.withColumn(field_name, col(field_name).cast(spark_type))
+
+            job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando Parquet...', 'percentage': 70}
             
-            potential_padding_columns = ['partition_data_month_id', 'partition_data_day_id']
-            for column_name in partition_columns:
-                if column_name in df_casted.columns and column_name in potential_padding_columns:
-                    df_casted[column_name] = df_casted[column_name].astype(str).str.zfill(2)
+            partition_columns = schema_data.get('partitions', [])
+            output_path = os.path.join(output_partitioned_base, parquet_name)
             
-            job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando archivos...', 'percentage': 66}
-            df_casted.to_sql(f"casteado_{parquet_name}", conn, index=False, if_exists='replace')
-            output_partitioned_path = os.path.join(output_partitioned_base, parquet_name)
-            if os.path.exists(output_partitioned_path): shutil.rmtree(output_partitioned_path)
-            write_options = {'path': output_partitioned_path, 'engine': 'pyarrow', 'index': False}
-            if partition_columns: write_options['partition_cols'] = partition_columns
-            df_casted.to_parquet(**write_options)
-            for dirpath, _, filenames in os.walk(output_partitioned_path):
-                if '_SUCCESS' in filenames: os.remove(os.path.join(dirpath, '_SUCCESS'))
+            if os.path.exists(output_path):
+                shutil.rmtree(output_path)
+            
+            writer = df_casted.write.mode("overwrite")
+            if partition_columns:
+                writer = writer.partitionBy(*partition_columns)
+            
+            writer.parquet(output_path)
+            
+            for dirpath, _, filenames in os.walk(output_path):
+                if '_SUCCESS' in filenames:
+                    os.remove(os.path.join(dirpath, '_SUCCESS'))
                 for filename in filenames:
-                    if filename.startswith('part-'):
-                        os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet")); break
+                    if filename.startswith('part-') and filename.endswith('.parquet'):
+                        os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet"))
+                        break
+            
+            # --- INICIO DE LA CORRECCIÓN PARA SQLITE ---
+            # Convertir a pandas para la previsualización
+            df_preview_pd = df_casted.limit(100).toPandas()
+            
+            # Convertir columnas de tipo Decimal a float, que SQLite sí entiende
+            for col_name in df_preview_pd.columns:
+                # Verificar si la columna contiene objetos Decimal
+                if not df_preview_pd[col_name].empty and isinstance(df_preview_pd[col_name].dropna().iloc[0], decimal.Decimal):
+                    df_preview_pd[col_name] = df_preview_pd[col_name].astype(float)
+            
+            # Guardar el DataFrame de pandas ya corregido en SQLite
+            df_preview_pd.to_sql(f"casteado_{parquet_name}", sqlite3.connect(get_db_path(session_id)), index=False, if_exists='replace')
+            # --- FIN DE LA CORRECCIÓN ---
+
             job_status[session_id]['progress'][parquet_name] = {'status': 'Completado', 'percentage': 100}
-        conn.close()
-        time.sleep(1) 
+
+        time.sleep(1)
         shutil.make_archive(os.path.join(session_path, "resultado_particionado"), 'zip', output_partitioned_base)
         job_status[session_id]['tables'] = selected_parquets
         job_status[session_id]['overall_status'] = 'completed'
-        status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w', encoding='utf-8') as f: json.dump(job_status[session_id], f)
+
     except Exception as e:
         import traceback
         error_info = f"[{type(e).__name__}] {str(e)}\n{traceback.format_exc()}"
         job_status[session_id]['overall_status'] = 'failed'
         job_status[session_id]['error'] = error_info
+    finally:
         status_file_path = os.path.join(session_path, 'status.json')
-        with open(status_file_path, 'w', encoding='utf-8') as f: json.dump(job_status[session_id], f)
+        with open(status_file_path, 'w', encoding='utf-8') as f:
+            json.dump(job_status[session_id], f)
+
+
+# --- (EL RESTO DEL CÓDIGO PERMANECE EXACTAMENTE IGUAL) ---
 
 # --- RUTAS DE LA APLICACIÓN (CASTEO Y GENERALES) ---
 def get_db_path(session_id):
@@ -184,7 +237,6 @@ def select_parquets():
         return redirect(request.referrer or url_for('casteo_index'))
     return redirect(url_for('upload_schemas'))
 
-# ... (El resto de las rutas de casteo que ya funcionan bien permanecen aquí sin cambios) ...
 @app.route('/upload_schemas', methods=['GET', 'POST'])
 def upload_schemas():
     if 'selected_parquets' not in session: return redirect(url_for('casteo_index'))
@@ -223,7 +275,7 @@ def upload_schemas():
             try:
                 csv_path = os.path.join(raw_folder, f"{parquet_name}.csv")
                 if not os.path.exists(csv_path): raise FileNotFoundError(f"La hoja '{parquet_name}' no se encontró en el archivo Excel.")
-                source_columns = set(pd.read_csv(csv_path, nrows=0).columns)
+                source_columns = set(pd.read_csv(csv_path, nrows=0, dtype=str).columns)
                 with open(schema_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
                 schema_columns = {field['name'] for field in schema_data['fields']}
                 missing_in_source = schema_columns - set(source_columns)
@@ -308,17 +360,32 @@ def download_selected_parquets():
     if not session_id: return "Error: Sesión no encontrada.", 404
     selected_tables = request.form.getlist('selected_tables')
     if not selected_tables: return "Error: No se seleccionó ninguna tabla para descargar.", 400
+    
     session_path = os.path.join(app.config['SESSION_FOLDER'], session_id)
-    db_path = get_db_path(session_id)
+    output_partitioned_base = os.path.join(session_path, 'output_partitioned')
     temp_zip_dir = os.path.join(session_path, f"temp_zip_{uuid.uuid4()}")
     os.makedirs(temp_zip_dir, exist_ok=True)
+    
     try:
-        conn = sqlite3.connect(db_path)
+        spark = get_spark_session()
         for table_name in selected_tables:
-            df = pd.read_sql_query(f'SELECT * FROM "casteado_{table_name}"', conn)
-            parquet_file_path = os.path.join(temp_zip_dir, f'{table_name}.parquet')
-            df.to_parquet(parquet_file_path, index=False)
-        conn.close()
+            parquet_folder_path = os.path.join(output_partitioned_base, table_name)
+            df = spark.read.parquet(parquet_folder_path)
+            
+            single_parquet_output_path = os.path.join(temp_zip_dir, table_name)
+            os.makedirs(single_parquet_output_path, exist_ok=True)
+            
+            df.coalesce(1).write.mode('overwrite').parquet(single_parquet_output_path)
+            
+            for filename in os.listdir(single_parquet_output_path):
+                if filename.startswith('part-') and filename.endswith('.parquet'):
+                    shutil.move(
+                        os.path.join(single_parquet_output_path, filename),
+                        os.path.join(temp_zip_dir, f"{table_name}.parquet")
+                    )
+                    break
+            shutil.rmtree(single_parquet_output_path)
+        
         zip_output_path_base = os.path.join(session_path, "parquets_consolidados")
         shutil.make_archive(zip_output_path_base, 'zip', temp_zip_dir)
         zip_full_path = f"{zip_output_path_base}.zip"
@@ -377,7 +444,7 @@ def process_malla_xml(xml_content):
                 })
             
             if not full_xml_string.strip().endswith('</JOB>'):
-                 errors.append({"line": len(xml_lines), "error": "Falta etiqueta de cierre </JOB>", "content": "El bloque del job no termina correctamente."})
+                errors.append({"line": len(xml_lines), "error": "Falta etiqueta de cierre </JOB>", "content": "El bloque del job no termina correctamente."})
 
             unique_id_to_job_info[unique_id] = {
                 "jobname": jobname, "parent_folder": parent_folder,
@@ -432,3 +499,15 @@ def upload_and_process_malla():
             return jsonify({'status': 'error', 'message': f'Error al procesar el archivo: {traceback.format_exc()}'}), 500
     
     return jsonify({'status': 'error', 'message': 'Formato de archivo no válido. Se esperaba un .xml'}), 400
+
+
+# --- EJECUCIÓN DE LA APLICACIÓN ---
+if __name__ == '__main__':
+    # Inicia la aplicación Flask
+    # Es recomendable usar un servidor WSGI como Gunicorn en producción
+    app.run(debug=True, use_reloader=False) # use_reloader=False es importante con Spark
+    
+    # Al cerrar la aplicación (Ctrl+C en la terminal), se detiene la sesión de Spark
+    if spark_session:
+        print("INFO: Deteniendo SparkSession...")
+        spark_session.stop()
