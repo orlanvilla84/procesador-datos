@@ -17,8 +17,8 @@ import decimal # <-- Importación necesaria para la corrección
 
 # --- IMPORTACIONES Y CONFIGURACIÓN DE PYSPARK ---
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, trim, to_date, to_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, DoubleType, FloatType, BooleanType, DateType, TimestampType, DecimalType
+from pyspark.sql.functions import col, trim, to_date, to_timestamp, from_json, split, regexp_replace
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, DoubleType, FloatType, BooleanType, DateType, TimestampType, DecimalType, ArrayType
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN DE FLASK ---
 app = Flask(__name__)
@@ -82,26 +82,40 @@ def background_casting_job(session_data):
             with open(schema_path, 'r', encoding='utf-8') as f:
                 schema_data = json.load(f)
 
-            # Paso 1: Leer el CSV como texto plano para evitar inferencias incorrectas
             df_raw = spark.read.csv(csv_path, header=True, inferSchema=False)
             df_casted = df_raw
 
             job_status[session_id]['progress'][parquet_name] = {'status': 'Aplicando tipos de datos...', 'percentage': 40}
             
-            # Paso 2: Castear explícitamente cada columna según el esquema
             for field in schema_data['fields']:
                 field_name = field['name']
                 if field_name not in df_casted.columns:
                     continue
 
                 field_type_info = field.get('type', 'string')
-                primary_type_str = [t for t in field_type_info if t != 'null'][0] if isinstance(field_type_info, list) else field_type_info
-                if isinstance(primary_type_str, dict):
-                    primary_type_str = primary_type_str.get('type', 'string')
+                primary_type_info = next((t for t in field_type_info if t != 'null'), field_type_info) if isinstance(field_type_info, list) else field_type_info
+
+                # --- INICIO DE LA SOLUCIÓN DEFINITIVA PARA ARRAYS ---
+                if isinstance(primary_type_info, dict) and primary_type_info.get('type') == 'array':
+                    # Este nuevo método es mucho más robusto que from_json.
+                    # 1. Quita los corchetes al inicio y al final de la cadena: '[A,B]' -> 'A,B'
+                    cleaned_col = regexp_replace(col(field_name), "^\\[|\\]$", "")
+                    
+                    # 2. Divide la cadena por la coma, ignorando espacios: 'A, B' -> ['A', 'B']
+                    #    El resultado ya es una columna de tipo array<string>.
+                    df_casted = df_casted.withColumn(field_name, split(cleaned_col, "\\s*,\\s*"))
+                    
+                    # Pasamos al siguiente campo
+                    continue
+                # --- FIN DE LA SOLUCIÓN DEFINITIVA PARA ARRAYS ---
+
+                if isinstance(primary_type_info, dict):
+                     primary_type_str = primary_type_info.get('type', 'string')
+                else:
+                     primary_type_str = primary_type_info
                 
-                primary_type_str = primary_type_str.lower()
+                primary_type_str = str(primary_type_str).lower()
                 
-                # --- LÓGICA DE CASTEO FINAL Y CORRECTA ---
                 spark_type = TYPE_MAP.get(primary_type_str)
                 
                 if primary_type_str == 'date':
@@ -120,8 +134,12 @@ def background_casting_job(session_data):
                 elif spark_type:
                     df_casted = df_casted.withColumn(field_name, col(field_name).cast(spark_type))
 
+            # (El resto de la función permanece igual)
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando Parquet...', 'percentage': 70}
-            
+            # ... (código para guardar, previsualizar, etc.) ...
+            # ...
+            # ...
+
             partition_columns = schema_data.get('partitions', [])
             output_path = os.path.join(output_partitioned_base, parquet_name)
             
@@ -142,19 +160,19 @@ def background_casting_job(session_data):
                         os.rename(os.path.join(dirpath, filename), os.path.join(dirpath, f"{parquet_name}.parquet"))
                         break
             
-            # --- INICIO DE LA CORRECCIÓN PARA SQLITE ---
-            # Convertir a pandas para la previsualización
             df_preview_pd = df_casted.limit(100).toPandas()
             
-            # Convertir columnas de tipo Decimal a float, que SQLite sí entiende
-            for col_name in df_preview_pd.columns:
-                # Verificar si la columna contiene objetos Decimal
-                if not df_preview_pd[col_name].empty and isinstance(df_preview_pd[col_name].dropna().iloc[0], decimal.Decimal):
-                    df_preview_pd[col_name] = df_preview_pd[col_name].astype(float)
+            for col_name, dtype in df_preview_pd.dtypes.items():
+                if isinstance(dtype, object):
+                    first_item = df_preview_pd[col_name].dropna().iloc[0] if not df_preview_pd[col_name].dropna().empty else None
+                    if isinstance(first_item, list):
+                        df_preview_pd[col_name] = df_preview_pd[col_name].astype(str)
+                if not df_preview_pd[col_name].empty:
+                    first_item = df_preview_pd[col_name].dropna().iloc[0] if not df_preview_pd[col_name].dropna().empty else None
+                    if isinstance(first_item, decimal.Decimal):
+                        df_preview_pd[col_name] = df_preview_pd[col_name].astype(float)
             
-            # Guardar el DataFrame de pandas ya corregido en SQLite
             df_preview_pd.to_sql(f"casteado_{parquet_name}", sqlite3.connect(get_db_path(session_id)), index=False, if_exists='replace')
-            # --- FIN DE LA CORRECCIÓN ---
 
             job_status[session_id]['progress'][parquet_name] = {'status': 'Completado', 'percentage': 100}
 
@@ -333,14 +351,40 @@ def get_table_schema(table_name):
     schema_file_path = os.path.join(app.config['SESSION_FOLDER'], session_id, 'esquemas', f"{table_name}.schema")
     try:
         if not os.path.exists(schema_file_path): return jsonify({"error": f"No se encontró el archivo de esquema para la tabla {table_name}"}), 404
+        
         with open(schema_file_path, 'r', encoding='utf-8') as f: schema_data = json.load(f)
+        
         schema_info = []
         for field in schema_data.get('fields', []):
-            field_name, field_type_info = field.get('name'), field.get('type')
-            primary_type = next((t for t in field_type_info if t != 'null'), 'desconocido') if isinstance(field_type_info, list) else field_type_info
-            if field_name: schema_info.append((field_name, primary_type))
+            field_name = field.get('name')
+            field_type_info = field.get('type')
+            
+            # --- INICIO DE LA CORRECCIÓN PARA VISUALIZACIÓN ---
+            # Esta lógica convierte el objeto del esquema en un texto legible
+            primary_type = next((t for t in field_type_info if t != 'null'), field_type_info) if isinstance(field_type_info, list) else field_type_info
+            
+            display_type = ""
+            if isinstance(primary_type, dict):
+                main_type = primary_type.get('type', 'desconocido')
+                if main_type == 'array':
+                    items = primary_type.get('items', {})
+                    # Los 'items' también pueden ser un dict o un string
+                    item_type = items.get('type') if isinstance(items, dict) else items
+                    display_type = f"array<{item_type}>"
+                else:
+                    # Para otros tipos complejos como decimal
+                    display_type = primary_type.get('logicalType', main_type)
+            else:
+                # Para tipos simples como "string"
+                display_type = str(primary_type)
+            # --- FIN DE LA CORRECCIÓN ---
+
+            if field_name:
+                schema_info.append((field_name, display_type))
+                
         return jsonify({"schema": schema_info})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/get_table_preview/<table_name>')
 def get_table_preview(table_name):
