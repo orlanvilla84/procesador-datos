@@ -95,24 +95,15 @@ def background_casting_job(session_data):
                 field_type_info = field.get('type', 'string')
                 primary_type_info = next((t for t in field_type_info if t != 'null'), field_type_info) if isinstance(field_type_info, list) else field_type_info
 
-                # --- INICIO DE LA SOLUCIÓN DEFINITIVA PARA ARRAYS ---
                 if isinstance(primary_type_info, dict) and primary_type_info.get('type') == 'array':
-                    # Este nuevo método es mucho más robusto que from_json.
-                    # 1. Quita los corchetes al inicio y al final de la cadena: '[A,B]' -> 'A,B'
                     cleaned_col = regexp_replace(col(field_name), "^\\[|\\]$", "")
-                    
-                    # 2. Divide la cadena por la coma, ignorando espacios: 'A, B' -> ['A', 'B']
-                    #    El resultado ya es una columna de tipo array<string>.
                     df_casted = df_casted.withColumn(field_name, split(cleaned_col, "\\s*,\\s*"))
-                    
-                    # Pasamos al siguiente campo
                     continue
-                # --- FIN DE LA SOLUCIÓN DEFINITIVA PARA ARRAYS ---
 
                 if isinstance(primary_type_info, dict):
-                     primary_type_str = primary_type_info.get('type', 'string')
+                        primary_type_str = primary_type_info.get('type', 'string')
                 else:
-                     primary_type_str = primary_type_info
+                        primary_type_str = primary_type_info
                 
                 primary_type_str = str(primary_type_str).lower()
                 
@@ -124,22 +115,24 @@ def background_casting_job(session_data):
                 elif primary_type_str == 'timestamp':
                     df_casted = df_casted.withColumn(field_name, to_timestamp(trim(col(field_name))))
                 
+                # --- INICIO DE LA SOLUCIÓN DINÁMICA ---
                 elif primary_type_str.startswith('decimal'):
-                    match = re.search(r'decimal\((\d+),?\s*(\d+)?\)', primary_type_str)
-                    if match:
-                        precision = int(match.group(1))
-                        scale = int(match.group(2) or 0)
-                        df_casted = df_casted.withColumn(field_name, col(field_name).cast(DecimalType(precision, scale)))
+                    # SOLUCIÓN: Ignoramos la precisión/escala del archivo de esquema
+                    # y aplicamos un tipo Decimal mucho más grande para evitar el error de overflow.
+                    # Decimal(38, 18) es un tipo seguro y de alta precisión.
+                    safe_precision = 38
+                    safe_scale = 18
+                    df_casted = df_casted.withColumn(
+                        field_name, 
+                        trim(col(field_name)).cast(DecimalType(safe_precision, safe_scale))
+                    )
+                # --- FIN DE LA SOLUCIÓN DINÁMICA ---
                 
                 elif spark_type:
                     df_casted = df_casted.withColumn(field_name, col(field_name).cast(spark_type))
 
-            # (El resto de la función permanece igual)
             job_status[session_id]['progress'][parquet_name] = {'status': 'Guardando Parquet...', 'percentage': 70}
-            # ... (código para guardar, previsualizar, etc.) ...
-            # ...
-            # ...
-
+            
             partition_columns = schema_data.get('partitions', [])
             output_path = os.path.join(output_partitioned_base, parquet_name)
             
@@ -150,6 +143,7 @@ def background_casting_job(session_data):
             if partition_columns:
                 writer = writer.partitionBy(*partition_columns)
             
+            # La línea que causaba el error ahora funcionará correctamente
             writer.parquet(output_path)
             
             for dirpath, _, filenames in os.walk(output_path):
