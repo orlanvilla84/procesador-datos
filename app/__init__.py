@@ -115,18 +115,15 @@ def background_casting_job(session_data):
                 elif primary_type_str == 'timestamp':
                     df_casted = df_casted.withColumn(field_name, to_timestamp(trim(col(field_name))))
                 
-                # --- INICIO DE LA SOLUCIÓN DINÁMICA ---
+                # --- INICIO DE LA SOLUCIÓN DE COHERENCIA ---
                 elif primary_type_str.startswith('decimal'):
-                    # SOLUCIÓN: Ignoramos la precisión/escala del archivo de esquema
-                    # y aplicamos un tipo Decimal mucho más grande para evitar el error de overflow.
-                    # Decimal(38, 18) es un tipo seguro y de alta precisión.
-                    safe_precision = 38
-                    safe_scale = 18
+                    # PASO 1: Para evitar el error de overflow, primero casteamos a un tipo de dato
+                    # numérico flexible como DoubleType. Esto maneja cualquier tamaño de número.
                     df_casted = df_casted.withColumn(
                         field_name, 
-                        trim(col(field_name)).cast(DecimalType(safe_precision, safe_scale))
+                        trim(col(field_name)).cast(DoubleType())
                     )
-                # --- FIN DE LA SOLUCIÓN DINÁMICA ---
+                # --- FIN DE LA SOLUCIÓN DE COHERENCIA ---
                 
                 elif spark_type:
                     df_casted = df_casted.withColumn(field_name, col(field_name).cast(spark_type))
@@ -143,7 +140,6 @@ def background_casting_job(session_data):
             if partition_columns:
                 writer = writer.partitionBy(*partition_columns)
             
-            # La línea que causaba el error ahora funcionará correctamente
             writer.parquet(output_path)
             
             for dirpath, _, filenames in os.walk(output_path):
