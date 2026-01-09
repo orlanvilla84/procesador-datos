@@ -1,0 +1,12 @@
+[Unit]
+Description=Servidor Web Python para Mallas
+After=network.target
+
+[Service]
+User=carlos
+WorkingDirectory=/opt/procesador-datos
+ExecStart=/opt/procesador-datos/start_web.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
