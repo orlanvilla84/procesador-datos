@@ -3,6 +3,11 @@ Description=Servidor Web Python para Mallas
 After=network.target
 
 [Service]
+# Ejecuta el comando de montaje como ROOT antes del script
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/mount -o remount,size=3G /tmp
+
+# Ejecuta tu script como usuario normal
 User=carlos
 WorkingDirectory=/opt/procesador-datos
 ExecStart=/opt/procesador-datos/start_web.sh
